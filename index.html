@@ -133,6 +133,13 @@
   }
   button.btn.danger:hover { background: #b71c1c; }
 
+  /* profile search */
+  #profile-search {
+    width: 100%; padding: .4rem .6rem; font-size: .95rem;
+    border: 1px solid var(--border); border-radius: 4px;
+    margin-bottom: .5rem; background: white; color: var(--fg);
+  }
+
   /* profile editor modal */
   .modal-backdrop {
     display: none; position: fixed; inset: 0;
@@ -171,6 +178,7 @@
 </nav>
 
 <section id="panel-profiles" class="panel active">
+  <input id="profile-search" type="search" placeholder="Filter profiles…" oninput="applyFilter()">
   <div id="list"><div class="empty">loading…</div></div>
   <div id="status">…</div>
 </section>
@@ -300,8 +308,13 @@ async function quitLauncher() {
 }
 
 let _pendingAutoOpen = false;
+let _lastState = null;
 
 // --- profiles panel ---
+function applyFilter() {
+  if (_lastState) renderProfiles(_lastState);
+}
+
 function sectionHeader(text) {
   const h = document.createElement("div");
   h.className = "section-header";
@@ -394,53 +407,68 @@ function profileRow(p, s, opts = {}) {
   return row;
 }
 
+function renderProfiles(s) {
+  const query = document.getElementById("profile-search").value.trim().toLowerCase();
+  const list = document.getElementById("list");
+  list.innerHTML = "";
+
+  const profiles = query
+    ? s.profiles.filter(p =>
+        p.name.toLowerCase().includes(query) ||
+        (p.description && p.description.toLowerCase().includes(query)))
+    : s.profiles;
+
+  if (!profiles.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = query
+      ? "No profiles match your search."
+      : "No profiles found. Add a .conf file to your profiles directory.";
+    list.appendChild(empty);
+    return;
+  }
+
+  const byId = Object.fromEntries(profiles.map(p => [p.id, p]));
+  const favSet = new Set(s.favorites);
+  const lastUsedId = s.last_used && byId[s.last_used] ? s.last_used : null;
+  // Favorites in storage order, minus last_used (which gets its own slot).
+  const favs = s.favorites.filter(id => id !== lastUsedId && byId[id]);
+  // Everything else, alphabetical by display name (already sorted by API).
+  const others = profiles.filter(p => p.id !== lastUsedId && !favSet.has(p.id));
+
+  if (lastUsedId) {
+    list.appendChild(profileRow(byId[lastUsedId], s, {
+      isLastUsed: true,
+      isFavorite: favSet.has(lastUsedId),
+    }));
+  }
+
+  if (favs.length) {
+    list.appendChild(sectionHeader("★ Favorites"));
+    favs.forEach((id, i) => list.appendChild(profileRow(byId[id], s, {
+      isFavorite: true,
+      showArrows: favs.length > 1,
+      canMoveUp: i > 0,
+      canMoveDown: i < favs.length - 1,
+    })));
+  }
+
+  if (others.length) {
+    // Only label this section if there's something above to distinguish it from.
+    if (lastUsedId || favs.length) list.appendChild(sectionHeader("Other profiles"));
+    others.forEach(p => list.appendChild(profileRow(p, s, {
+      isFavorite: favSet.has(p.id),
+    })));
+  }
+}
+
 async function refreshState() {
   let s;
   try { s = await (await fetch("/api/state")).json(); }
   catch { document.getElementById("status").textContent = "connection lost"; return; }
 
-  const list = document.getElementById("list");
-  list.innerHTML = "";
-
-  if (!s.profiles.length) {
-    const empty = document.createElement("div");
-    empty.className = "empty";
-    empty.textContent = "No profiles found. Add a .conf file to your profiles directory.";
-    list.appendChild(empty);
-  } else {
-    const byId = Object.fromEntries(s.profiles.map(p => [p.id, p]));
-    const favSet = new Set(s.favorites);
-    const lastUsedId = s.last_used && byId[s.last_used] ? s.last_used : null;
-    // Favorites in storage order, minus last_used (which gets its own slot).
-    const favs = s.favorites.filter(id => id !== lastUsedId && byId[id]);
-    // Everything else, alphabetical by display name (already sorted by API).
-    const others = s.profiles.filter(p => p.id !== lastUsedId && !favSet.has(p.id));
-
-    if (lastUsedId) {
-      list.appendChild(profileRow(byId[lastUsedId], s, {
-        isLastUsed: true,
-        isFavorite: favSet.has(lastUsedId),
-      }));
-    }
-
-    if (favs.length) {
-      list.appendChild(sectionHeader("★ Favorites"));
-      favs.forEach((id, i) => list.appendChild(profileRow(byId[id], s, {
-        isFavorite: true,
-        showArrows: favs.length > 1,
-        canMoveUp: i > 0,
-        canMoveDown: i < favs.length - 1,
-      })));
-    }
-
-    if (others.length) {
-      // Only label this section if there's something above to distinguish it from.
-      if (lastUsedId || favs.length) list.appendChild(sectionHeader("Other profiles"));
-      others.forEach(p => list.appendChild(profileRow(p, s, {
-        isFavorite: favSet.has(p.id),
-      })));
-    }
-  }
+  _lastState = s;
+  renderProfiles(s);
 
   const runningProfile = s.profiles.find(p => p.id === s.running);
   const runningLabel = runningProfile ? runningProfile.name : s.running;
