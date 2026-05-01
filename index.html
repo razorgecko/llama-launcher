@@ -24,6 +24,7 @@
     border-bottom: 2px solid transparent; margin-bottom: -1px;
   }
   nav button.active { color: var(--fg); border-color: var(--fg); }
+  nav button.quit { margin-left: auto; color: #c62828; font-size: .85rem; padding: .35rem .8rem; }
   .panel { display: none; }
   .panel.active { display: block; }
 
@@ -175,6 +176,7 @@
   <button id="tab-profiles" class="active" onclick="showTab('profiles')">Profiles</button>
   <button id="tab-logs" onclick="showTab('logs')">Logs</button>
   <button id="tab-settings" onclick="showTab('settings')">Settings</button>
+  <button class="quit" onclick="quitLauncher()">Quit</button>
 </nav>
 
 <section id="panel-profiles" class="panel active">
@@ -199,11 +201,6 @@
       <span id="save-msg"></span>
     </div>
   </form>
-  <div class="danger-zone">
-    <h3>Danger zone</h3>
-    <p class="hint">Stop the launcher web server. Any running model will be stopped first.</p>
-    <button class="btn danger" onclick="quitLauncher()">Quit launcher</button>
-  </div>
 </section>
 
 <div id="modal-backdrop" class="modal-backdrop">
