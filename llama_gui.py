@@ -55,35 +55,40 @@ def save_config(cfg):
 # ---- user state (favorites, last_used) -------------------------------------
 
 STATE_PATH = SCRIPT_DIR / "state.json"
-DEFAULT_STATE = {"last_used": None, "favorites": []}
-state_lock = threading.Lock()
 
-def load_state():
-    """Read state.json. Returns defaults on missing/corrupt file."""
-    if not STATE_PATH.exists():
-        return {"last_used": None, "favorites": []}
-    try:
-        s = json.loads(STATE_PATH.read_text())
-    except json.JSONDecodeError as e:
-        print(f"warning: state.json is invalid ({e}); resetting", file=sys.stderr)
-        return {"last_used": None, "favorites": []}
-    return {
-        "last_used": s.get("last_used") if isinstance(s.get("last_used"), str) else None,
-        "favorites": [f for f in s.get("favorites", []) if isinstance(f, str)],
-    }
+class StateStore:
+    """Thread-safe storage for user state (favorites, last_used).
+    All mutations go through update() which atomically read-modify-writes."""
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
 
-def save_state(s):
-    tmp = STATE_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(s, indent=2) + "\n")
-    os.replace(tmp, STATE_PATH)
+    def load(self):
+        """Read the JSON file. Returns defaults on missing/corrupt file."""
+        if not self.path.exists():
+            return {"last_used": None, "favorites": []}
+        try:
+            s = json.loads(self.path.read_text())
+        except json.JSONDecodeError as e:
+            print(f"warning: {self.path.name} is invalid ({e}); resetting", file=sys.stderr)
+            return {"last_used": None, "favorites": []}
+        return {
+            "last_used": s.get("last_used") if isinstance(s.get("last_used"), str) else None,
+            "favorites": [f for f in s.get("favorites", []) if isinstance(f, str)],
+        }
 
-def update_state(mutator):
-    """Atomic read-modify-write. mutator(s) mutates in place; return value is ignored."""
-    with state_lock:
-        s = load_state()
-        mutator(s)
-        save_state(s)
-        return s
+    def save(self, s):
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(s, indent=2) + "\n")
+        os.replace(tmp, self.path)
+
+    def update(self, mutator):
+        """Atomic read-modify-write. mutator(s) mutates in place."""
+        with self.lock:
+            s = self.load()
+            mutator(s)
+            self.save(s)
+            return s
 
 def profiles_path(cfg):
     p = Path(cfg["profiles_dir"]).expanduser()
@@ -208,152 +213,154 @@ class Runner:
             self.profile_name = None
             self.profile_port = None
 
-runner = Runner()
-
 # ---- HTTP -------------------------------------------------------------------
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *a):
-        pass  # keep stdout clean for llama-server logs
+def make_handler(runner, store):
+    """Build a request handler class bound to the given runner and store."""
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass  # keep stdout clean for llama-server logs
 
-    def _send(self, code, ctype, body):
-        if isinstance(body, str):
-            body = body.encode()
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        def _send(self, code, ctype, body):
+            if isinstance(body, str):
+                body = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-    def _send_json(self, payload, code=200):
-        self._send(code, "application/json", json.dumps(payload))
+        def _send_json(self, payload, code=200):
+            self._send(code, "application/json", json.dumps(payload))
 
-    def _read_json(self):
-        length = int(self.headers.get("Content-Length", 0))
-        if not length:
-            return {}
-        try:
-            return json.loads(self.rfile.read(length))
-        except json.JSONDecodeError:
-            return None
-
-    # -- GET --
-    def do_GET(self):
-        path = urlparse(self.path).path
-        if path == "/":
-            self._send(200, "text/html; charset=utf-8", INDEX_PATH.read_bytes())
-        elif path == "/api/state":
-            cfg = load_config()
-            running = runner.is_running()
+        def _read_json(self):
+            length = int(self.headers.get("Content-Length", 0))
+            if not length:
+                return {}
             try:
-                profile_files = sorted(profiles_path(cfg).glob("*.conf"))
-            except FileNotFoundError:
-                profile_files = []
-            profiles = []
-            for p in profile_files:
-                meta = read_profile_meta(p)
-                profiles.append({
-                    "id": p.stem,
-                    "name": meta.get("name") or p.stem,
-                    "description": meta.get("description", ""),
+                return json.loads(self.rfile.read(length))
+            except json.JSONDecodeError:
+                return None
+
+        # -- GET --
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path == "/":
+                self._send(200, "text/html; charset=utf-8", INDEX_PATH.read_bytes())
+            elif path == "/api/state":
+                cfg = load_config()
+                running = runner.is_running()
+                try:
+                    profile_files = sorted(profiles_path(cfg).glob("*.conf"))
+                except FileNotFoundError:
+                    profile_files = []
+                profiles = []
+                for p in profile_files:
+                    meta = read_profile_meta(p)
+                    profiles.append({
+                        "id": p.stem,
+                        "name": meta.get("name") or p.stem,
+                        "description": meta.get("description", ""),
+                    })
+                # Sort alphabetically by display name (case-insensitive).
+                profiles.sort(key=lambda p: p["name"].lower())
+                valid_ids = {p["id"] for p in profiles}
+                us = store.load()
+                last_used = us["last_used"] if us["last_used"] in valid_ids else None
+                favorites = [f for f in us["favorites"] if f in valid_ids]
+                self._send_json({
+                    "profiles": profiles,
+                    "running": runner.profile_name if running else None,
+                    "port": runner.profile_port if running else None,
+                    "auto_open_model_ui": cfg["auto_open_model_ui"],
+                    "last_used": last_used,
+                    "favorites": favorites,
                 })
-            # Sort alphabetically by display name (case-insensitive).
-            profiles.sort(key=lambda p: p["name"].lower())
-            valid_ids = {p["id"] for p in profiles}
-            us = load_state()
-            last_used = us["last_used"] if us["last_used"] in valid_ids else None
-            favorites = [f for f in us["favorites"] if f in valid_ids]
-            self._send_json({
-                "profiles": profiles,
-                "running": runner.profile_name if running else None,
-                "port": runner.profile_port if running else None,
-                "auto_open_model_ui": cfg["auto_open_model_ui"],
-                "last_used": last_used,
-                "favorites": favorites,
-            })
-        elif path == "/api/config":
-            cfg = load_config()
-            self._send_json({
-                "config": cfg,
-                "defaults": DEFAULT_CONFIG,
-                "restart_fields": sorted(RESTART_FIELDS),
-            })
-        else:
-            self.send_error(404)
+            elif path == "/api/config":
+                cfg = load_config()
+                self._send_json({
+                    "config": cfg,
+                    "defaults": DEFAULT_CONFIG,
+                    "restart_fields": sorted(RESTART_FIELDS),
+                })
+            else:
+                self.send_error(404)
 
-    # -- POST --
-    def do_POST(self):
-        u = urlparse(self.path)
-        params = parse_qs(u.query)
-        if u.path == "/api/start":
-            name = params.get("profile", [""])[0]
-            cfg = load_config()
-            conf = profiles_path(cfg) / f"{name}.conf"
-            if not conf.is_file():
-                return self._send_json({"ok": False, "error": "no such profile"}, 404)
-            args, port, _meta = parse_profile(conf)
-            # Record last_used since the user explicitly chose this profile.
-            update_state(lambda s: s.update({"last_used": name}))
-            try:
-                runner.start(name, args, port, llama_bin(cfg))
-            except FileNotFoundError:
-                return self._send_json({"ok": False, "error": f"binary not found: {llama_bin(cfg)}"}, 500)
-            self._send_json({"ok": True, "port": port})
-        elif u.path == "/api/stop":
-            runner.stop()
-            self._send_json({"ok": True})
-        elif u.path == "/api/favorite":
-            name = params.get("profile", [""])[0]
-            if not name:
-                return self._send_json({"ok": False, "error": "missing profile"}, 400)
-            def toggle(s):
-                if name in s["favorites"]:
-                    s["favorites"].remove(name)
-                else:
-                    s["favorites"].append(name)
-            update_state(toggle)
-            self._send_json({"ok": True})
-        elif u.path == "/api/move":
-            name = params.get("profile", [""])[0]
-            direction = params.get("direction", [""])[0]
-            if direction not in ("up", "down"):
-                return self._send_json({"ok": False, "error": "bad direction"}, 400)
-            def move(s):
-                favs = s["favorites"]
-                last = s["last_used"]
-                # Visible order excludes last_used (which lives in its own slot).
-                visible = [f for f in favs if f != last]
-                if name not in visible:
-                    return
-                i = visible.index(name)
-                j = i + (-1 if direction == "up" else 1)
-                if j < 0 or j >= len(visible):
-                    return
-                neighbor = visible[j]
-                a, b = favs.index(name), favs.index(neighbor)
-                favs[a], favs[b] = favs[b], favs[a]
-            update_state(move)
-            self._send_json({"ok": True})
-        elif u.path == "/api/config":
-            body = self._read_json()
-            if body is None:
-                return self._send_json({"ok": False, "error": "invalid JSON"}, 400)
-            cfg = load_config()
-            # Only accept known keys; ignore others.
-            updated = dict(cfg)
-            for k, v in body.items():
-                if k in DEFAULT_CONFIG:
-                    updated[k] = v
-            # Light type validation against defaults.
-            for k, v in updated.items():
-                if not isinstance(v, type(DEFAULT_CONFIG[k])):
-                    return self._send_json(
-                        {"ok": False, "error": f"wrong type for {k}"}, 400)
-            save_config(updated)
-            needs_restart = any(updated[k] != cfg[k] for k in RESTART_FIELDS)
-            self._send_json({"ok": True, "needs_restart": needs_restart})
-        else:
-            self.send_error(404)
+        # -- POST --
+        def do_POST(self):
+            u = urlparse(self.path)
+            params = parse_qs(u.query)
+            if u.path == "/api/start":
+                name = params.get("profile", [""])[0]
+                cfg = load_config()
+                conf = profiles_path(cfg) / f"{name}.conf"
+                if not conf.is_file():
+                    return self._send_json({"ok": False, "error": "no such profile"}, 404)
+                args, port, _meta = parse_profile(conf)
+                # Record last_used since the user explicitly chose this profile.
+                store.update(lambda s: s.update({"last_used": name}))
+                try:
+                    runner.start(name, args, port, llama_bin(cfg))
+                except FileNotFoundError:
+                    return self._send_json({"ok": False, "error": f"binary not found: {llama_bin(cfg)}"}, 500)
+                self._send_json({"ok": True, "port": port})
+            elif u.path == "/api/stop":
+                runner.stop()
+                self._send_json({"ok": True})
+            elif u.path == "/api/favorite":
+                name = params.get("profile", [""])[0]
+                if not name:
+                    return self._send_json({"ok": False, "error": "missing profile"}, 400)
+                def toggle(s):
+                    if name in s["favorites"]:
+                        s["favorites"].remove(name)
+                    else:
+                        s["favorites"].append(name)
+                store.update(toggle)
+                self._send_json({"ok": True})
+            elif u.path == "/api/move":
+                name = params.get("profile", [""])[0]
+                direction = params.get("direction", [""])[0]
+                if direction not in ("up", "down"):
+                    return self._send_json({"ok": False, "error": "bad direction"}, 400)
+                def move(s):
+                    favs = s["favorites"]
+                    last = s["last_used"]
+                    # Visible order excludes last_used (which lives in its own slot).
+                    visible = [f for f in favs if f != last]
+                    if name not in visible:
+                        return
+                    i = visible.index(name)
+                    j = i + (-1 if direction == "up" else 1)
+                    if j < 0 or j >= len(visible):
+                        return
+                    neighbor = visible[j]
+                    a, b = favs.index(name), favs.index(neighbor)
+                    favs[a], favs[b] = favs[b], favs[a]
+                store.update(move)
+                self._send_json({"ok": True})
+            elif u.path == "/api/config":
+                body = self._read_json()
+                if body is None:
+                    return self._send_json({"ok": False, "error": "invalid JSON"}, 400)
+                cfg = load_config()
+                # Only accept known keys; ignore others.
+                updated = dict(cfg)
+                for k, v in body.items():
+                    if k in DEFAULT_CONFIG:
+                        updated[k] = v
+                # Light type validation against defaults.
+                for k, v in updated.items():
+                    if not isinstance(v, type(DEFAULT_CONFIG[k])):
+                        return self._send_json(
+                            {"ok": False, "error": f"wrong type for {k}"}, 400)
+                save_config(updated)
+                needs_restart = any(updated[k] != cfg[k] for k in RESTART_FIELDS)
+                self._send_json({"ok": True, "needs_restart": needs_restart})
+            else:
+                self.send_error(404)
+
+    return Handler
 
 # ---- main -------------------------------------------------------------------
 
@@ -376,8 +383,12 @@ def main():
     if cfg["open_browser_on_launch"]:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
 
+    runner = Runner()
+    store = StateStore(STATE_PATH)
+    handler_cls = make_handler(runner, store)
+
     try:
-        with ReusableTCPServer((cfg["host"], cfg["port"]), Handler) as srv:
+        with ReusableTCPServer((cfg["host"], cfg["port"]), handler_cls) as srv:
             srv.serve_forever()
     except KeyboardInterrupt:
         print("\nshutting down")
