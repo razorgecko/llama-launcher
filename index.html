@@ -33,10 +33,12 @@
     border-radius: 6px; margin: .4rem 0; background: white;
   }
   .row.running { background: var(--accent-bg); border-color: var(--accent); }
+  .row.loading { background: var(--warn-bg); border-color: var(--warn); }
   .row .row-text { min-width: 0; flex: 1; }
   .row .name { font-weight: 600; }
   .row .desc { font-size: .85em; color: var(--muted); margin-top: .15rem; }
   .row .badge { color: var(--accent); margin-left: .5rem; font-size: .85em; font-weight: normal; }
+  .row .badge.loading { color: var(--warn); }
   .row .actions { display: flex; gap: .5rem; align-items: center; flex-shrink: 0; }
   .row a { color: var(--accent); text-decoration: none; font-size: .9em; }
   .row a:hover { text-decoration: underline; }
@@ -297,6 +299,8 @@ async function quitLauncher() {
     </div>`;
 }
 
+let _pendingAutoOpen = false;
+
 // --- profiles panel ---
 function sectionHeader(text) {
   const h = document.createElement("div");
@@ -309,9 +313,10 @@ function profileRow(p, s, opts = {}) {
   const { isLastUsed = false, isFavorite = false,
           showArrows = false, canMoveUp = false, canMoveDown = false } = opts;
   const isRunning = p.id === s.running;
+  const isReady = isRunning && s.ready;
 
   const row = document.createElement("div");
-  row.className = "row" + (isRunning ? " running" : "");
+  row.className = "row" + (isReady ? " running" : isRunning ? " loading" : "");
 
   // Left: name (with badges) + description
   const left = document.createElement("div");
@@ -327,8 +332,8 @@ function profileRow(p, s, opts = {}) {
   }
   if (isRunning) {
     const badge = document.createElement("span");
-    badge.className = "badge";
-    badge.textContent = "● running";
+    badge.className = "badge" + (isReady ? "" : " loading");
+    badge.textContent = isReady ? "● running" : "● loading…";
     nameEl.appendChild(badge);
   }
   left.appendChild(nameEl);
@@ -365,7 +370,7 @@ function profileRow(p, s, opts = {}) {
   star.onclick = () => favoriteAction(p.id);
   actions.appendChild(star);
 
-  if (isRunning && s.port) {
+  if (isReady && s.port) {
     const link = document.createElement("a");
     link.href = `http://localhost:${s.port}`;
     link.target = "_blank"; link.rel = "noopener";
@@ -439,17 +444,24 @@ async function refreshState() {
 
   const runningProfile = s.profiles.find(p => p.id === s.running);
   const runningLabel = runningProfile ? runningProfile.name : s.running;
+  const statusVerb = s.running ? (s.ready ? "running" : "loading…") : null;
   document.getElementById("status").textContent =
-    s.running ? `running: ${runningLabel}${s.port ? ` (port ${s.port})` : ""}` : "idle";
+    s.running ? `${statusVerb}: ${runningLabel}${s.port ? ` (port ${s.port})` : ""}` : "idle";
 
   window._autoOpen = s.auto_open_model_ui;
+
+  if (_pendingAutoOpen && s.ready && s.port) {
+    window.open(`http://localhost:${s.port}`, "_blank", "noopener");
+    _pendingAutoOpen = false;
+  }
+  if (!s.running) _pendingAutoOpen = false;
 }
 
 async function action(verb, id) {
   const r = await fetch(`/api/${verb}?profile=${encodeURIComponent(id)}`, { method: "POST" });
   const j = await r.json().catch(() => ({}));
   if (verb === "start" && j.ok && window._autoOpen && j.port) {
-    setTimeout(() => window.open(`http://localhost:${j.port}`, "_blank", "noopener"), 1500);
+    _pendingAutoOpen = true;
   }
   if (!j.ok && j.error) alert(j.error);
   refreshState();

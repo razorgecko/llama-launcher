@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import webbrowser
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -212,6 +213,7 @@ class Runner:
         self.proc = None
         self.profile_name = None
         self.profile_port = None
+        self._ready = False
         self.logs_lock = threading.Lock()
         self.logs = collections.deque(maxlen=self.LOG_MAX_LINES)
         self._next_idx = 0
@@ -261,6 +263,7 @@ class Runner:
             self.proc = None
             self.profile_name = None
             self.profile_port = None
+            self._ready = False
             return False
 
     def _terminate_locked(self):
@@ -272,9 +275,28 @@ class Runner:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
 
+    def _health_poller(self, port, proc):
+        """Poll /health until 200 or process exits (5-minute timeout)."""
+        url = f"http://127.0.0.1:{port}/health"
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return
+            try:
+                with urllib.request.urlopen(url, timeout=2) as resp:
+                    if resp.status == 200:
+                        with self.lock:
+                            if self.proc is proc:
+                                self._ready = True
+                        return
+            except Exception:
+                pass
+            time.sleep(0.5)
+
     def start(self, name, args, port, binary):
         with self.lock:
             self._terminate_locked()
+            self._ready = False
             self._emit("system", f"--- starting {name} ({binary}) ---")
             self.proc = subprocess.Popen(
                 [binary] + args,
@@ -291,6 +313,12 @@ class Runner:
                 t = threading.Thread(
                     target=self._reader, args=(stream_name, fh), daemon=True)
                 t.start()
+            if port:
+                t = threading.Thread(
+                    target=self._health_poller, args=(port, self.proc), daemon=True)
+                t.start()
+            else:
+                self._ready = True  # no port to poll; assume ready
 
     def stop(self):
         with self.lock:
@@ -299,6 +327,7 @@ class Runner:
             self.proc = None
             self.profile_name = None
             self.profile_port = None
+            self._ready = False
         if was_running:
             self._emit("system", "--- stopped ---")
 
@@ -390,6 +419,7 @@ def make_handler(runner, store):
                 "profiles": profiles,
                 "running": runner.profile_name if running else None,
                 "port": runner.profile_port if running else None,
+                "ready": runner._ready if running else None,
                 "auto_open_model_ui": cfg["auto_open_model_ui"],
                 "last_used": last_used,
                 "favorites": favorites,
