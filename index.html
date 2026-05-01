@@ -100,6 +100,36 @@
   #save-msg.ok { color: var(--accent); }
   #save-msg.warn { color: var(--warn); }
   #save-msg.err { color: #c62828; }
+
+  /* logs */
+  .logs-toolbar {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: .5rem;
+  }
+  #logs-meta { font-size: .85em; color: var(--muted); }
+  .logs-output {
+    height: 70vh; overflow-y: auto;
+    background: #1e1e1e; color: #e0e0e0;
+    border-radius: 6px; padding: .6rem .8rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: .82rem; line-height: 1.4;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .log-line { padding: 1px 0; }
+  .log-line.err    { color: #ff8a80; }
+  .log-line.system { color: #80cbc4; font-style: italic; }
+
+  /* danger zone */
+  .danger-zone {
+    margin-top: 2.5rem; padding: 1rem; border: 1px solid #ef9a9a;
+    border-radius: 6px; background: #ffebee;
+  }
+  .danger-zone h3 { margin: 0 0 .3rem; color: #c62828; font-size: 1rem; }
+  .danger-zone .hint { font-size: .85em; color: #555; margin: 0 0 .8rem; }
+  button.btn.danger {
+    background: #c62828; color: white; border-color: #c62828;
+  }
+  button.btn.danger:hover { background: #b71c1c; }
 </style>
 </head>
 <body>
@@ -108,12 +138,21 @@
 
 <nav>
   <button id="tab-profiles" class="active" onclick="showTab('profiles')">Profiles</button>
+  <button id="tab-logs" onclick="showTab('logs')">Logs</button>
   <button id="tab-settings" onclick="showTab('settings')">Settings</button>
 </nav>
 
 <section id="panel-profiles" class="panel active">
   <div id="list"><div class="empty">loading…</div></div>
   <div id="status">…</div>
+</section>
+
+<section id="panel-logs" class="panel">
+  <div class="logs-toolbar">
+    <span id="logs-meta">—</span>
+    <button class="btn" onclick="clearLogs()">Clear</button>
+  </div>
+  <div id="logs-output" class="logs-output"></div>
 </section>
 
 <section id="panel-settings" class="panel">
@@ -124,6 +163,11 @@
       <span id="save-msg"></span>
     </div>
   </form>
+  <div class="danger-zone">
+    <h3>Danger zone</h3>
+    <p class="hint">Stop the launcher web server. Any running model will be stopped first.</p>
+    <button class="btn danger" onclick="quitLauncher()">Quit launcher</button>
+  </div>
 </section>
 
 <script>
@@ -140,11 +184,79 @@ let restartFields = [];
 
 // --- tabs ---
 function showTab(name) {
-  for (const t of ["profiles", "settings"]) {
+  for (const t of ["profiles", "logs", "settings"]) {
     document.getElementById("tab-" + t).classList.toggle("active", t === name);
     document.getElementById("panel-" + t).classList.toggle("active", t === name);
   }
   if (name === "settings") loadSettings();
+  if (name === "logs") startLogsPolling();
+  else stopLogsPolling();
+}
+
+// --- logs panel ---
+let logCursor = 0;
+let logsInterval = null;
+let logsAutoscroll = true;
+
+function startLogsPolling() {
+  refreshLogs();
+  if (!logsInterval) logsInterval = setInterval(refreshLogs, 1000);
+}
+function stopLogsPolling() {
+  if (logsInterval) { clearInterval(logsInterval); logsInterval = null; }
+}
+
+async function refreshLogs() {
+  let j;
+  try { j = await (await fetch(`/api/logs?since=${logCursor}`)).json(); }
+  catch { return; }
+  const out = document.getElementById("logs-output");
+  for (const line of j.lines) {
+    const div = document.createElement("div");
+    div.className = "log-line " + line.stream;
+    div.textContent = line.text;
+    out.appendChild(div);
+  }
+  // Cap rendered lines so the DOM doesn't grow unbounded over a long session.
+  const MAX_DOM_LINES = 6000;
+  while (out.childElementCount > MAX_DOM_LINES) out.removeChild(out.firstChild);
+
+  logCursor = j.next;
+  document.getElementById("logs-meta").textContent =
+    j.next === 0 ? "no logs yet" : `${out.childElementCount} lines shown`;
+  if (j.lines.length && logsAutoscroll) {
+    out.scrollTop = out.scrollHeight;
+  }
+}
+
+async function clearLogs() {
+  await fetch("/api/logs/clear", { method: "POST" });
+  document.getElementById("logs-output").innerHTML = "";
+  // Don't reset logCursor — server's next_idx keeps advancing. Re-fetching
+  // from 0 would be wasted bandwidth (server has dropped those lines anyway).
+  refreshLogs();
+}
+
+// Detect whether the user has scrolled away from the bottom; if so, stop
+// auto-scrolling so they can read history without being yanked back.
+window.addEventListener("DOMContentLoaded", () => {
+  const out = document.getElementById("logs-output");
+  out.addEventListener("scroll", () => {
+    const slack = out.scrollHeight - out.scrollTop - out.clientHeight;
+    logsAutoscroll = slack < 5;
+  });
+});
+
+// --- quit ---
+async function quitLauncher() {
+  if (!confirm("Quit the launcher? Any running model will be stopped.")) return;
+  try { await fetch("/api/quit", { method: "POST" }); } catch {}
+  document.body.innerHTML = `
+    <div style="max-width:520px;margin:4rem auto;padding:2rem;text-align:center;
+                font-family:system-ui;color:#444;">
+      <h2>Launcher stopped.</h2>
+      <p>You can close this tab.</p>
+    </div>`;
 }
 
 // --- profiles panel ---

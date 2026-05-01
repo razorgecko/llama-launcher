@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Web GUI launcher for llama.cpp profiles. Stdlib only."""
+import collections
 import http.server
 import json
 import os
@@ -9,6 +10,7 @@ import socketserver
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -172,46 +174,109 @@ def read_profile_meta(path):
 # ---- process runner ---------------------------------------------------------
 
 class Runner:
-    """Shared mutable state for the running llama-server, if any."""
+    """Manages the running llama-server subprocess and captures its output.
+
+    Two locks: `lock` guards the process slot (proc/name/port). `logs_lock`
+    guards the log buffer. They are separate to prevent a deadlock where
+    start() holds `lock` while waiting for an old process to terminate, but
+    that process's reader threads need a lock to flush their final lines.
+    """
+    LOG_MAX_LINES = 5000
+
     def __init__(self):
         self.lock = threading.Lock()
         self.proc = None
         self.profile_name = None
         self.profile_port = None
+        self.logs_lock = threading.Lock()
+        self.logs = collections.deque(maxlen=self.LOG_MAX_LINES)
+        self._next_idx = 0
 
+    # -- log helpers --
+    def _emit(self, stream, text):
+        """Append a single log line. text may contain a trailing newline; stripped."""
+        with self.logs_lock:
+            self.logs.append({
+                "idx": self._next_idx,
+                "stream": stream,
+                "text": text.rstrip("\n"),
+            })
+            self._next_idx += 1
+
+    def _reader(self, stream_name, fileobj):
+        """Thread target: read lines from fileobj until EOF."""
+        try:
+            for line in iter(fileobj.readline, ""):
+                self._emit(stream_name, line)
+        except (OSError, ValueError):
+            pass  # pipe closed, file detached, etc.
+        finally:
+            try:
+                fileobj.close()
+            except OSError:
+                pass
+
+    def get_logs(self, since=0):
+        """Return (lines, next_idx) where lines have idx >= since."""
+        with self.logs_lock:
+            lines = [l for l in self.logs if l["idx"] >= since]
+            return lines, self._next_idx
+
+    def clear_logs(self):
+        """Empty the log buffer. The index counter keeps advancing so any
+        pending pollers naturally fetch nothing rather than re-fetching old
+        lines."""
+        with self.logs_lock:
+            self.logs.clear()
+
+    # -- process control --
     def is_running(self):
         with self.lock:
             if self.proc and self.proc.poll() is None:
                 return True
-            # Reap finished process.
             self.proc = None
             self.profile_name = None
             self.profile_port = None
             return False
 
+    def _terminate_locked(self):
+        """Caller must hold self.lock."""
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
     def start(self, name, args, port, binary):
         with self.lock:
-            if self.proc and self.proc.poll() is None:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
-            self.proc = subprocess.Popen([binary] + args)
+            self._terminate_locked()
+            self._emit("system", f"--- starting {name} ({binary}) ---")
+            self.proc = subprocess.Popen(
+                [binary] + args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=1,
+                text=True,
+                errors="replace",
+            )
             self.profile_name = name
             self.profile_port = port
+            for stream_name, fh in (("out", self.proc.stdout), ("err", self.proc.stderr)):
+                t = threading.Thread(
+                    target=self._reader, args=(stream_name, fh), daemon=True)
+                t.start()
 
     def stop(self):
         with self.lock:
-            if self.proc and self.proc.poll() is None:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
+            was_running = self.proc is not None and self.proc.poll() is None
+            self._terminate_locked()
             self.proc = None
             self.profile_name = None
             self.profile_port = None
+        if was_running:
+            self._emit("system", "--- stopped ---")
 
 # ---- HTTP -------------------------------------------------------------------
 
@@ -283,6 +348,13 @@ def make_handler(runner, store):
                     "defaults": DEFAULT_CONFIG,
                     "restart_fields": sorted(RESTART_FIELDS),
                 })
+            elif path == "/api/logs":
+                try:
+                    since = int(parse_qs(urlparse(self.path).query).get("since", ["0"])[0])
+                except ValueError:
+                    since = 0
+                lines, next_idx = runner.get_logs(since)
+                self._send_json({"lines": lines, "next": next_idx})
             else:
                 self.send_error(404)
 
@@ -302,7 +374,9 @@ def make_handler(runner, store):
                 try:
                     runner.start(name, args, port, llama_bin(cfg))
                 except FileNotFoundError:
-                    return self._send_json({"ok": False, "error": f"binary not found: {llama_bin(cfg)}"}, 500)
+                    msg = f"binary not found: {llama_bin(cfg)}"
+                    runner._emit("system", f"ERROR: {msg}")
+                    return self._send_json({"ok": False, "error": msg}, 500)
                 self._send_json({"ok": True, "port": port})
             elif u.path == "/api/stop":
                 runner.stop()
@@ -357,6 +431,19 @@ def make_handler(runner, store):
                 save_config(updated)
                 needs_restart = any(updated[k] != cfg[k] for k in RESTART_FIELDS)
                 self._send_json({"ok": True, "needs_restart": needs_restart})
+            elif u.path == "/api/logs/clear":
+                runner.clear_logs()
+                self._send_json({"ok": True})
+            elif u.path == "/api/quit":
+                # Reply first; then shut down on a worker thread.
+                # Calling server.shutdown() from a handler thread deadlocks.
+                self._send_json({"ok": True})
+                srv = self.server
+                def shutdown_seq():
+                    runner.stop()
+                    time.sleep(0.1)  # let the response flush
+                    srv.shutdown()
+                threading.Thread(target=shutdown_seq, daemon=True).start()
             else:
                 self.send_error(404)
 
