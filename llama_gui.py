@@ -52,6 +52,39 @@ def save_config(cfg):
     tmp.write_text(json.dumps(cfg, indent=2) + "\n")
     os.replace(tmp, CONFIG_PATH)
 
+# ---- user state (favorites, last_used) -------------------------------------
+
+STATE_PATH = SCRIPT_DIR / "state.json"
+DEFAULT_STATE = {"last_used": None, "favorites": []}
+state_lock = threading.Lock()
+
+def load_state():
+    """Read state.json. Returns defaults on missing/corrupt file."""
+    if not STATE_PATH.exists():
+        return {"last_used": None, "favorites": []}
+    try:
+        s = json.loads(STATE_PATH.read_text())
+    except json.JSONDecodeError as e:
+        print(f"warning: state.json is invalid ({e}); resetting", file=sys.stderr)
+        return {"last_used": None, "favorites": []}
+    return {
+        "last_used": s.get("last_used") if isinstance(s.get("last_used"), str) else None,
+        "favorites": [f for f in s.get("favorites", []) if isinstance(f, str)],
+    }
+
+def save_state(s):
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(s, indent=2) + "\n")
+    os.replace(tmp, STATE_PATH)
+
+def update_state(mutator):
+    """Atomic read-modify-write. mutator(s) mutates in place; return value is ignored."""
+    with state_lock:
+        s = load_state()
+        mutator(s)
+        save_state(s)
+        return s
+
 def profiles_path(cfg):
     p = Path(cfg["profiles_dir"]).expanduser()
     if not p.is_absolute():
@@ -131,9 +164,9 @@ def read_profile_meta(path):
         pass
     return meta
 
-# ---- process state ----------------------------------------------------------
+# ---- process runner ---------------------------------------------------------
 
-class State:
+class Runner:
     """Shared mutable state for the running llama-server, if any."""
     def __init__(self):
         self.lock = threading.Lock()
@@ -175,7 +208,7 @@ class State:
             self.profile_name = None
             self.profile_port = None
 
-state = State()
+runner = Runner()
 
 # ---- HTTP -------------------------------------------------------------------
 
@@ -211,7 +244,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, "text/html; charset=utf-8", INDEX_PATH.read_bytes())
         elif path == "/api/state":
             cfg = load_config()
-            running = state.is_running()
+            running = runner.is_running()
             try:
                 profile_files = sorted(profiles_path(cfg).glob("*.conf"))
             except FileNotFoundError:
@@ -224,11 +257,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "name": meta.get("name") or p.stem,
                     "description": meta.get("description", ""),
                 })
+            # Sort alphabetically by display name (case-insensitive).
+            profiles.sort(key=lambda p: p["name"].lower())
+            valid_ids = {p["id"] for p in profiles}
+            us = load_state()
+            last_used = us["last_used"] if us["last_used"] in valid_ids else None
+            favorites = [f for f in us["favorites"] if f in valid_ids]
             self._send_json({
                 "profiles": profiles,
-                "running": state.profile_name if running else None,
-                "port": state.profile_port if running else None,
+                "running": runner.profile_name if running else None,
+                "port": runner.profile_port if running else None,
                 "auto_open_model_ui": cfg["auto_open_model_ui"],
+                "last_used": last_used,
+                "favorites": favorites,
             })
         elif path == "/api/config":
             cfg = load_config()
@@ -251,13 +292,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not conf.is_file():
                 return self._send_json({"ok": False, "error": "no such profile"}, 404)
             args, port, _meta = parse_profile(conf)
+            # Record last_used since the user explicitly chose this profile.
+            update_state(lambda s: s.update({"last_used": name}))
             try:
-                state.start(name, args, port, llama_bin(cfg))
+                runner.start(name, args, port, llama_bin(cfg))
             except FileNotFoundError:
                 return self._send_json({"ok": False, "error": f"binary not found: {llama_bin(cfg)}"}, 500)
             self._send_json({"ok": True, "port": port})
         elif u.path == "/api/stop":
-            state.stop()
+            runner.stop()
+            self._send_json({"ok": True})
+        elif u.path == "/api/favorite":
+            name = params.get("profile", [""])[0]
+            if not name:
+                return self._send_json({"ok": False, "error": "missing profile"}, 400)
+            def toggle(s):
+                if name in s["favorites"]:
+                    s["favorites"].remove(name)
+                else:
+                    s["favorites"].append(name)
+            update_state(toggle)
+            self._send_json({"ok": True})
+        elif u.path == "/api/move":
+            name = params.get("profile", [""])[0]
+            direction = params.get("direction", [""])[0]
+            if direction not in ("up", "down"):
+                return self._send_json({"ok": False, "error": "bad direction"}, 400)
+            def move(s):
+                favs = s["favorites"]
+                last = s["last_used"]
+                # Visible order excludes last_used (which lives in its own slot).
+                visible = [f for f in favs if f != last]
+                if name not in visible:
+                    return
+                i = visible.index(name)
+                j = i + (-1 if direction == "up" else 1)
+                if j < 0 or j >= len(visible):
+                    return
+                neighbor = visible[j]
+                a, b = favs.index(name), favs.index(neighbor)
+                favs[a], favs[b] = favs[b], favs[a]
+            update_state(move)
             self._send_json({"ok": True})
         elif u.path == "/api/config":
             body = self._read_json()
@@ -306,7 +381,7 @@ def main():
             srv.serve_forever()
     except KeyboardInterrupt:
         print("\nshutting down")
-        state.stop()
+        runner.stop()
 
 if __name__ == "__main__":
     main()

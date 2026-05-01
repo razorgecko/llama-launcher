@@ -57,6 +57,30 @@
   }
   .empty { color: var(--muted); padding: 1rem; text-align: center; font-style: italic; }
 
+  .section-header {
+    margin: 1.2rem 0 .3rem; padding: 0 .2rem;
+    font-size: .8em; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .06em;
+  }
+  .row .star {
+    background: none; border: none; padding: .2rem .4rem;
+    cursor: pointer; font-size: 1.1rem; color: var(--muted); line-height: 1;
+  }
+  .row .star.on { color: #f9a825; }
+  .row .star:hover { color: #f9a825; }
+  .row .arrow {
+    background: white; border: 1px solid var(--border); padding: .15rem .35rem;
+    cursor: pointer; font-size: .85rem; color: var(--muted);
+    border-radius: 3px; line-height: 1;
+  }
+  .row .arrow:hover:not(:disabled) { background: #f0f0f0; color: var(--fg); }
+  .row .arrow:disabled { opacity: .25; cursor: default; }
+  .last-used-badge {
+    display: inline-block; font-size: .7em; padding: 1px 6px;
+    background: #e3f2fd; color: #0d47a1; border-radius: 3px;
+    margin-left: .5rem; vertical-align: middle; font-weight: normal;
+  }
+
   /* settings */
   .field { margin: .8rem 0; }
   .field label { display: block; font-weight: 600; margin-bottom: .25rem; }
@@ -124,16 +148,33 @@ function showTab(name) {
 }
 
 // --- profiles panel ---
-function profileRow(p, runningId, runningPort) {
-  const isRunning = p.id === runningId;
+function sectionHeader(text) {
+  const h = document.createElement("div");
+  h.className = "section-header";
+  h.textContent = text;
+  return h;
+}
+
+function profileRow(p, s, opts = {}) {
+  const { isLastUsed = false, isFavorite = false,
+          showArrows = false, canMoveUp = false, canMoveDown = false } = opts;
+  const isRunning = p.id === s.running;
+
   const row = document.createElement("div");
   row.className = "row" + (isRunning ? " running" : "");
 
+  // Left: name (with badges) + description
   const left = document.createElement("div");
   left.className = "row-text";
   const nameEl = document.createElement("div");
   nameEl.className = "name";
   nameEl.textContent = p.name;
+  if (isLastUsed) {
+    const badge = document.createElement("span");
+    badge.className = "last-used-badge";
+    badge.textContent = "last used";
+    nameEl.appendChild(badge);
+  }
   if (isRunning) {
     const badge = document.createElement("span");
     badge.className = "badge";
@@ -147,24 +188,47 @@ function profileRow(p, runningId, runningPort) {
     desc.textContent = p.description;
     left.appendChild(desc);
   }
+  row.appendChild(left);
 
+  // Right: actions
   const actions = document.createElement("span");
   actions.className = "actions";
-  if (isRunning && runningPort) {
+
+  if (showArrows) {
+    const up = document.createElement("button");
+    up.className = "arrow"; up.textContent = "↑"; up.title = "Move up";
+    up.disabled = !canMoveUp;
+    up.onclick = () => moveAction(p.id, "up");
+    actions.appendChild(up);
+
+    const down = document.createElement("button");
+    down.className = "arrow"; down.textContent = "↓"; down.title = "Move down";
+    down.disabled = !canMoveDown;
+    down.onclick = () => moveAction(p.id, "down");
+    actions.appendChild(down);
+  }
+
+  const star = document.createElement("button");
+  star.className = "star" + (isFavorite ? " on" : "");
+  star.textContent = isFavorite ? "★" : "☆";
+  star.title = isFavorite ? "Remove from favorites" : "Add to favorites";
+  star.onclick = () => favoriteAction(p.id);
+  actions.appendChild(star);
+
+  if (isRunning && s.port) {
     const link = document.createElement("a");
-    link.href = `http://localhost:${runningPort}`;
-    link.target = "_blank";
-    link.rel = "noopener";
+    link.href = `http://localhost:${s.port}`;
+    link.target = "_blank"; link.rel = "noopener";
     link.textContent = "Open UI ↗";
     actions.appendChild(link);
   }
+
   const btn = document.createElement("button");
   btn.className = "btn" + (isRunning ? "" : " primary");
   btn.textContent = isRunning ? "Stop" : "Start";
   btn.onclick = () => action(isRunning ? "stop" : "start", p.id);
   actions.appendChild(btn);
 
-  row.appendChild(left);
   row.appendChild(actions);
   return row;
 }
@@ -176,13 +240,45 @@ async function refreshState() {
 
   const list = document.getElementById("list");
   list.innerHTML = "";
+
   if (!s.profiles.length) {
     const empty = document.createElement("div");
     empty.className = "empty";
     empty.textContent = "No profiles found. Add a .conf file to your profiles directory.";
     list.appendChild(empty);
   } else {
-    for (const p of s.profiles) list.appendChild(profileRow(p, s.running, s.port));
+    const byId = Object.fromEntries(s.profiles.map(p => [p.id, p]));
+    const favSet = new Set(s.favorites);
+    const lastUsedId = s.last_used && byId[s.last_used] ? s.last_used : null;
+    // Favorites in storage order, minus last_used (which gets its own slot).
+    const favs = s.favorites.filter(id => id !== lastUsedId && byId[id]);
+    // Everything else, alphabetical by display name (already sorted by API).
+    const others = s.profiles.filter(p => p.id !== lastUsedId && !favSet.has(p.id));
+
+    if (lastUsedId) {
+      list.appendChild(profileRow(byId[lastUsedId], s, {
+        isLastUsed: true,
+        isFavorite: favSet.has(lastUsedId),
+      }));
+    }
+
+    if (favs.length) {
+      list.appendChild(sectionHeader("★ Favorites"));
+      favs.forEach((id, i) => list.appendChild(profileRow(byId[id], s, {
+        isFavorite: true,
+        showArrows: favs.length > 1,
+        canMoveUp: i > 0,
+        canMoveDown: i < favs.length - 1,
+      })));
+    }
+
+    if (others.length) {
+      // Only label this section if there's something above to distinguish it from.
+      if (lastUsedId || favs.length) list.appendChild(sectionHeader("Other profiles"));
+      others.forEach(p => list.appendChild(profileRow(p, s, {
+        isFavorite: favSet.has(p.id),
+      })));
+    }
   }
 
   const runningProfile = s.profiles.find(p => p.id === s.running);
@@ -200,6 +296,16 @@ async function action(verb, id) {
     setTimeout(() => window.open(`http://localhost:${j.port}`, "_blank", "noopener"), 1500);
   }
   if (!j.ok && j.error) alert(j.error);
+  refreshState();
+}
+
+async function favoriteAction(id) {
+  await fetch(`/api/favorite?profile=${encodeURIComponent(id)}`, { method: "POST" });
+  refreshState();
+}
+
+async function moveAction(id, direction) {
+  await fetch(`/api/move?profile=${encodeURIComponent(id)}&direction=${direction}`, { method: "POST" });
   refreshState();
 }
 
