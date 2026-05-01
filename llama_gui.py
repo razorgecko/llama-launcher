@@ -33,26 +33,49 @@ RESTART_FIELDS = {"port", "host"}
 
 # ---- config -----------------------------------------------------------------
 
+_cfg_lock = threading.RLock()
+_cfg_cache = None
+_cfg_mtime = 0.0
+
 def load_config():
     """Load config, creating it from defaults if missing. Fills in any missing keys."""
-    if not CONFIG_PATH.exists():
-        save_config(DEFAULT_CONFIG)
-        return dict(DEFAULT_CONFIG)
-    try:
-        cfg = json.loads(CONFIG_PATH.read_text())
-    except json.JSONDecodeError as e:
-        print(f"warning: config.json is invalid ({e}); using defaults", file=sys.stderr)
-        return dict(DEFAULT_CONFIG)
-    # Merge with defaults so newly-added fields appear without manual editing.
-    merged = dict(DEFAULT_CONFIG)
-    merged.update({k: v for k, v in cfg.items() if k in DEFAULT_CONFIG})
-    return merged
+    global _cfg_cache, _cfg_mtime
+    with _cfg_lock:
+        try:
+            mtime = CONFIG_PATH.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        if _cfg_cache is not None and mtime == _cfg_mtime:
+            return dict(_cfg_cache)
+        if not CONFIG_PATH.exists():
+            save_config(DEFAULT_CONFIG)
+            return dict(DEFAULT_CONFIG)
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text())
+        except json.JSONDecodeError as e:
+            print(f"warning: config.json is invalid ({e}); using defaults", file=sys.stderr)
+            return dict(DEFAULT_CONFIG)
+        merged = dict(DEFAULT_CONFIG)
+        merged.update({k: v for k, v in cfg.items() if k in DEFAULT_CONFIG})
+        _cfg_cache = merged
+        try:
+            _cfg_mtime = CONFIG_PATH.stat().st_mtime
+        except OSError:
+            pass
+        return dict(merged)
 
 def save_config(cfg):
     """Atomic write so a crash mid-write doesn't corrupt the file."""
+    global _cfg_cache, _cfg_mtime
     tmp = CONFIG_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(cfg, indent=2) + "\n")
     os.replace(tmp, CONFIG_PATH)
+    with _cfg_lock:
+        _cfg_cache = dict(cfg)
+        try:
+            _cfg_mtime = CONFIG_PATH.stat().st_mtime
+        except OSError:
+            _cfg_mtime = 0.0
 
 # ---- user state (favorites, last_used) -------------------------------------
 
@@ -120,7 +143,7 @@ def _parse_meta_line(line):
         return key, value
     return None
 
-def parse_profile(path):
+def parse_profile(path, meta_only=False):
     """Return (args, port, meta) from a .conf file.
 
     - Comments starting with # are stripped from arg parsing.
@@ -128,47 +151,42 @@ def parse_profile(path):
       into the meta dict (keys: name, description). They must appear on their
       own line, anywhere in the file. First occurrence wins.
     - Tokens starting with ~ are expanded to the user's home directory.
+    - With meta_only=True, skips arg parsing and returns early once all
+      META_KEYS are found (used by read_profile_meta for cheap listing polls).
     """
     args, port, meta = [], None, {}
-    for line in path.read_text().splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("#"):
-            kv = _parse_meta_line(stripped)
-            if kv and kv[0] not in meta:
-                meta[kv[0]] = kv[1]
-            continue
-        tokens = [
-            os.path.expanduser(t) if t.startswith("~") else t
-            for t in shlex.split(stripped)
-        ]
-        args += tokens
-        if "--port" in tokens:
-            try:
-                port = int(tokens[tokens.index("--port") + 1])
-            except (IndexError, ValueError):
-                pass
-    return args, port, meta
-
-def read_profile_meta(path):
-    """Cheap version of parse_profile that only reads meta fields.
-    Used for the listing endpoint so we don't shlex.split every profile
-    on every poll. Stops as soon as all known META_KEYS are found."""
-    meta = {}
-    try:
-        with path.open() as f:
-            for line in f:
-                stripped = line.strip()
-                if not stripped or not stripped.startswith("#"):
-                    continue
+    with path.open() as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
                 kv = _parse_meta_line(stripped)
                 if kv and kv[0] not in meta:
                     meta[kv[0]] = kv[1]
-                    if len(meta) == len(META_KEYS):
-                        break
+                    if meta_only and len(meta) == len(META_KEYS):
+                        return args, port, meta
+                continue
+            if meta_only:
+                continue
+            tokens = [
+                os.path.expanduser(t) if t.startswith("~") else t
+                for t in shlex.split(stripped)
+            ]
+            args += tokens
+            if "--port" in tokens:
+                try:
+                    port = int(tokens[tokens.index("--port") + 1])
+                except (IndexError, ValueError):
+                    pass
+    return args, port, meta
+
+def read_profile_meta(path):
+    """Thin wrapper: parse meta only, suppressing OSError for the listing poll."""
+    try:
+        _, _, meta = parse_profile(path, meta_only=True)
     except OSError:
-        pass
+        return {}
     return meta
 
 # ---- process runner ---------------------------------------------------------
@@ -283,8 +301,23 @@ class Runner:
 def make_handler(runner, store):
     """Build a request handler class bound to the given runner and store."""
     class Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *a):
-            pass  # keep stdout clean for llama-server logs
+        _GET_ROUTES = {
+            "/":           "_get_root",
+            "/api/state":  "_get_state",
+            "/api/config": "_get_config",
+            "/api/logs":   "_get_logs",
+        }
+        _POST_ROUTES = {
+            "/api/start":      "_post_start",
+            "/api/stop":       "_post_stop",
+            "/api/favorite":   "_post_favorite",
+            "/api/move":       "_post_move",
+            "/api/config":     "_post_config",
+            "/api/logs/clear": "_post_logs_clear",
+            "/api/quit":       "_post_quit",
+        }
+
+        def log_message(self, *a): pass
 
         def _send(self, code, ctype, body):
             if isinstance(body, str):
@@ -307,145 +340,161 @@ def make_handler(runner, store):
             except json.JSONDecodeError:
                 return None
 
-        # -- GET --
-        def do_GET(self):
-            path = urlparse(self.path).path
-            if path == "/":
-                self._send(200, "text/html; charset=utf-8", INDEX_PATH.read_bytes())
-            elif path == "/api/state":
-                cfg = load_config()
-                running = runner.is_running()
-                try:
-                    profile_files = sorted(profiles_path(cfg).glob("*.conf"))
-                except FileNotFoundError:
-                    profile_files = []
-                profiles = []
-                for p in profile_files:
-                    meta = read_profile_meta(p)
-                    profiles.append({
-                        "id": p.stem,
-                        "name": meta.get("name") or p.stem,
-                        "description": meta.get("description", ""),
-                    })
-                # Sort alphabetically by display name (case-insensitive).
-                profiles.sort(key=lambda p: p["name"].lower())
-                valid_ids = {p["id"] for p in profiles}
-                us = store.load()
-                last_used = us["last_used"] if us["last_used"] in valid_ids else None
-                favorites = [f for f in us["favorites"] if f in valid_ids]
-                self._send_json({
-                    "profiles": profiles,
-                    "running": runner.profile_name if running else None,
-                    "port": runner.profile_port if running else None,
-                    "auto_open_model_ui": cfg["auto_open_model_ui"],
-                    "last_used": last_used,
-                    "favorites": favorites,
-                })
-            elif path == "/api/config":
-                cfg = load_config()
-                self._send_json({
-                    "config": cfg,
-                    "defaults": DEFAULT_CONFIG,
-                    "restart_fields": sorted(RESTART_FIELDS),
-                })
-            elif path == "/api/logs":
-                try:
-                    since = int(parse_qs(urlparse(self.path).query).get("since", ["0"])[0])
-                except ValueError:
-                    since = 0
-                lines, next_idx = runner.get_logs(since)
-                self._send_json({"lines": lines, "next": next_idx})
+        def _dispatch(self, routes):
+            parsed = urlparse(self.path)
+            self._qs = parse_qs(parsed.query)
+            m = routes.get(parsed.path)
+            if m:
+                getattr(self, m)()
             else:
                 self.send_error(404)
 
-        # -- POST --
-        def do_POST(self):
-            u = urlparse(self.path)
-            params = parse_qs(u.query)
-            if u.path == "/api/start":
-                name = params.get("profile", [""])[0]
-                cfg = load_config()
-                conf = profiles_path(cfg) / f"{name}.conf"
-                if not conf.is_file():
-                    return self._send_json({"ok": False, "error": "no such profile"}, 404)
-                args, port, _meta = parse_profile(conf)
-                # Record last_used since the user explicitly chose this profile.
-                store.update(lambda s: s.update({"last_used": name}))
-                try:
-                    runner.start(name, args, port, llama_bin(cfg))
-                except FileNotFoundError:
-                    msg = f"binary not found: {llama_bin(cfg)}"
-                    runner._emit("system", f"ERROR: {msg}")
-                    return self._send_json({"ok": False, "error": msg}, 500)
-                self._send_json({"ok": True, "port": port})
-            elif u.path == "/api/stop":
+        def do_GET(self):  self._dispatch(self._GET_ROUTES)
+        def do_POST(self): self._dispatch(self._POST_ROUTES)
+
+        # -- GET handlers --
+
+        def _get_root(self):
+            self._send(200, "text/html; charset=utf-8", INDEX_PATH.read_bytes())
+
+        def _get_state(self):
+            cfg = load_config()
+            running = runner.is_running()
+            try:
+                profile_files = sorted(profiles_path(cfg).glob("*.conf"))
+            except FileNotFoundError:
+                profile_files = []
+            profiles = []
+            for p in profile_files:
+                meta = read_profile_meta(p)
+                profiles.append({
+                    "id": p.stem,
+                    "name": meta.get("name") or p.stem,
+                    "description": meta.get("description", ""),
+                })
+            # Sort alphabetically by display name (case-insensitive).
+            profiles.sort(key=lambda p: p["name"].lower())
+            valid_ids = {p["id"] for p in profiles}
+            us = store.load()
+            last_used = us["last_used"] if us["last_used"] in valid_ids else None
+            favorites = [f for f in us["favorites"] if f in valid_ids]
+            self._send_json({
+                "profiles": profiles,
+                "running": runner.profile_name if running else None,
+                "port": runner.profile_port if running else None,
+                "auto_open_model_ui": cfg["auto_open_model_ui"],
+                "last_used": last_used,
+                "favorites": favorites,
+            })
+
+        def _get_config(self):
+            cfg = load_config()
+            self._send_json({
+                "config": cfg,
+                "defaults": DEFAULT_CONFIG,
+                "restart_fields": sorted(RESTART_FIELDS),
+            })
+
+        def _get_logs(self):
+            try:
+                since = int(self._qs.get("since", ["0"])[0])
+            except ValueError:
+                since = 0
+            lines, next_idx = runner.get_logs(since)
+            self._send_json({"lines": lines, "next": next_idx})
+
+        # -- POST handlers --
+
+        def _post_start(self):
+            name = self._qs.get("profile", [""])[0]
+            cfg = load_config()
+            conf = profiles_path(cfg) / f"{name}.conf"
+            if not conf.is_file():
+                return self._send_json({"ok": False, "error": "no such profile"}, 404)
+            args, port, _meta = parse_profile(conf)
+            # Record last_used since the user explicitly chose this profile.
+            store.update(lambda s: s.update({"last_used": name}))
+            try:
+                runner.start(name, args, port, llama_bin(cfg))
+            except FileNotFoundError:
+                msg = f"binary not found: {llama_bin(cfg)}"
+                runner._emit("system", f"ERROR: {msg}")
+                return self._send_json({"ok": False, "error": msg}, 500)
+            self._send_json({"ok": True, "port": port})
+
+        def _post_stop(self):
+            runner.stop()
+            self._send_json({"ok": True})
+
+        def _post_favorite(self):
+            name = self._qs.get("profile", [""])[0]
+            if not name:
+                return self._send_json({"ok": False, "error": "missing profile"}, 400)
+            def toggle(s):
+                if name in s["favorites"]:
+                    s["favorites"].remove(name)
+                else:
+                    s["favorites"].append(name)
+            store.update(toggle)
+            self._send_json({"ok": True})
+
+        def _post_move(self):
+            name = self._qs.get("profile", [""])[0]
+            direction = self._qs.get("direction", [""])[0]
+            if direction not in ("up", "down"):
+                return self._send_json({"ok": False, "error": "bad direction"}, 400)
+            def move(s):
+                favs = s["favorites"]
+                last = s["last_used"]
+                # Visible order excludes last_used (which lives in its own slot).
+                visible = [f for f in favs if f != last]
+                if name not in visible:
+                    return
+                i = visible.index(name)
+                j = i + (-1 if direction == "up" else 1)
+                if j < 0 or j >= len(visible):
+                    return
+                neighbor = visible[j]
+                a, b = favs.index(name), favs.index(neighbor)
+                favs[a], favs[b] = favs[b], favs[a]
+            store.update(move)
+            self._send_json({"ok": True})
+
+        def _post_config(self):
+            body = self._read_json()
+            if body is None:
+                return self._send_json({"ok": False, "error": "invalid JSON"}, 400)
+            cfg = load_config()
+            # Only accept known keys; ignore others.
+            updated = dict(cfg)
+            for k, v in body.items():
+                if k in DEFAULT_CONFIG:
+                    updated[k] = v
+            # Light type validation against defaults.
+            for k, v in updated.items():
+                if not isinstance(v, type(DEFAULT_CONFIG[k])):
+                    return self._send_json(
+                        {"ok": False, "error": f"wrong type for {k}"}, 400)
+            if not (1 <= updated["port"] <= 65535):
+                return self._send_json({"ok": False, "error": "port must be 1-65535"}, 400)
+            save_config(updated)
+            needs_restart = any(updated[k] != cfg[k] for k in RESTART_FIELDS)
+            self._send_json({"ok": True, "needs_restart": needs_restart})
+
+        def _post_logs_clear(self):
+            runner.clear_logs()
+            self._send_json({"ok": True})
+
+        def _post_quit(self):
+            # Reply first; then shut down on a worker thread.
+            # Calling server.shutdown() from a handler thread deadlocks.
+            self._send_json({"ok": True})
+            srv = self.server
+            def shutdown_seq():
                 runner.stop()
-                self._send_json({"ok": True})
-            elif u.path == "/api/favorite":
-                name = params.get("profile", [""])[0]
-                if not name:
-                    return self._send_json({"ok": False, "error": "missing profile"}, 400)
-                def toggle(s):
-                    if name in s["favorites"]:
-                        s["favorites"].remove(name)
-                    else:
-                        s["favorites"].append(name)
-                store.update(toggle)
-                self._send_json({"ok": True})
-            elif u.path == "/api/move":
-                name = params.get("profile", [""])[0]
-                direction = params.get("direction", [""])[0]
-                if direction not in ("up", "down"):
-                    return self._send_json({"ok": False, "error": "bad direction"}, 400)
-                def move(s):
-                    favs = s["favorites"]
-                    last = s["last_used"]
-                    # Visible order excludes last_used (which lives in its own slot).
-                    visible = [f for f in favs if f != last]
-                    if name not in visible:
-                        return
-                    i = visible.index(name)
-                    j = i + (-1 if direction == "up" else 1)
-                    if j < 0 or j >= len(visible):
-                        return
-                    neighbor = visible[j]
-                    a, b = favs.index(name), favs.index(neighbor)
-                    favs[a], favs[b] = favs[b], favs[a]
-                store.update(move)
-                self._send_json({"ok": True})
-            elif u.path == "/api/config":
-                body = self._read_json()
-                if body is None:
-                    return self._send_json({"ok": False, "error": "invalid JSON"}, 400)
-                cfg = load_config()
-                # Only accept known keys; ignore others.
-                updated = dict(cfg)
-                for k, v in body.items():
-                    if k in DEFAULT_CONFIG:
-                        updated[k] = v
-                # Light type validation against defaults.
-                for k, v in updated.items():
-                    if not isinstance(v, type(DEFAULT_CONFIG[k])):
-                        return self._send_json(
-                            {"ok": False, "error": f"wrong type for {k}"}, 400)
-                save_config(updated)
-                needs_restart = any(updated[k] != cfg[k] for k in RESTART_FIELDS)
-                self._send_json({"ok": True, "needs_restart": needs_restart})
-            elif u.path == "/api/logs/clear":
-                runner.clear_logs()
-                self._send_json({"ok": True})
-            elif u.path == "/api/quit":
-                # Reply first; then shut down on a worker thread.
-                # Calling server.shutdown() from a handler thread deadlocks.
-                self._send_json({"ok": True})
-                srv = self.server
-                def shutdown_seq():
-                    runner.stop()
-                    time.sleep(0.1)  # let the response flush
-                    srv.shutdown()
-                threading.Thread(target=shutdown_seq, daemon=True).start()
-            else:
-                self.send_error(404)
+                time.sleep(0.1)  # let the response flush
+                srv.shutdown()
+            threading.Thread(target=shutdown_seq, daemon=True).start()
 
     return Handler
 
