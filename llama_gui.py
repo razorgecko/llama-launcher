@@ -189,6 +189,12 @@ def read_profile_meta(path):
         return {}
     return meta
 
+_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\- .]*$")
+
+def _valid_profile_id(name):
+    """True if name is safe to use as a profile filename stem (no path traversal)."""
+    return bool(name and _PROFILE_ID_RE.match(name) and ".." not in name)
+
 # ---- process runner ---------------------------------------------------------
 
 class Runner:
@@ -302,10 +308,11 @@ def make_handler(runner, store):
     """Build a request handler class bound to the given runner and store."""
     class Handler(http.server.BaseHTTPRequestHandler):
         _GET_ROUTES = {
-            "/":           "_get_root",
-            "/api/state":  "_get_state",
-            "/api/config": "_get_config",
-            "/api/logs":   "_get_logs",
+            "/":            "_get_root",
+            "/api/state":   "_get_state",
+            "/api/config":  "_get_config",
+            "/api/logs":    "_get_logs",
+            "/api/profile": "_get_profile",
         }
         _POST_ROUTES = {
             "/api/start":      "_post_start",
@@ -313,6 +320,7 @@ def make_handler(runner, store):
             "/api/favorite":   "_post_favorite",
             "/api/move":       "_post_move",
             "/api/config":     "_post_config",
+            "/api/profile":    "_post_profile",
             "/api/logs/clear": "_post_logs_clear",
             "/api/quit":       "_post_quit",
         }
@@ -403,6 +411,20 @@ def make_handler(runner, store):
             lines, next_idx = runner.get_logs(since)
             self._send_json({"lines": lines, "next": next_idx})
 
+        def _get_profile(self):
+            name = self._qs.get("profile", [""])[0]
+            if not _valid_profile_id(name):
+                return self._send_json({"ok": False, "error": "invalid profile id"}, 400)
+            cfg = load_config()
+            conf = profiles_path(cfg) / f"{name}.conf"
+            if not conf.is_file():
+                return self._send_json({"ok": False, "error": "no such profile"}, 404)
+            try:
+                content = conf.read_text()
+            except OSError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 500)
+            self._send_json({"ok": True, "content": content})
+
         # -- POST handlers --
 
         def _post_start(self):
@@ -480,6 +502,23 @@ def make_handler(runner, store):
             save_config(updated)
             needs_restart = any(updated[k] != cfg[k] for k in RESTART_FIELDS)
             self._send_json({"ok": True, "needs_restart": needs_restart})
+
+        def _post_profile(self):
+            name = self._qs.get("profile", [""])[0]
+            if not _valid_profile_id(name):
+                return self._send_json({"ok": False, "error": "invalid profile id"}, 400)
+            body = self._read_json()
+            if body is None or not isinstance(body.get("content"), str):
+                return self._send_json({"ok": False, "error": "missing content"}, 400)
+            cfg = load_config()
+            conf = profiles_path(cfg) / f"{name}.conf"
+            tmp = conf.with_suffix(".conf.tmp")
+            try:
+                tmp.write_text(body["content"])
+                os.replace(tmp, conf)
+            except OSError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 500)
+            self._send_json({"ok": True})
 
         def _post_logs_clear(self):
             runner.clear_logs()
