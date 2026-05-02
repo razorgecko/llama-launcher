@@ -35,6 +35,7 @@ DEFAULT_CONFIG = {
     "llama_bin": "llama-server",
     "sd_bin": "sd-server",
     "profiles_dir": str(_XDG_CONFIG_HOME / "llama-launcher" / "profiles"),
+    "models_dir": "",
     "open_browser_on_launch": True,
     "auto_open_model_ui": False,
 }
@@ -159,6 +160,22 @@ def llama_bin(cfg):
 def sd_bin(cfg):
     b = cfg["sd_bin"]
     return str(Path(b).expanduser()) if "~" in b or "/" in b else b
+
+def _resolve_model_args(args, cfg):
+    """Resolve --model values starting with ./ against models_dir.
+    Anything else (absolute path, ~, plain name) is left untouched."""
+    mdir_str = cfg.get("models_dir", "")
+    if not mdir_str:
+        return args
+    mdir = Path(mdir_str).expanduser()
+    result = list(args)
+    for i, token in enumerate(result):
+        if token == "--model" and i + 1 < len(result):
+            val = result[i + 1]
+            if val.startswith("./"):
+                result[i + 1] = str(mdir / val)
+            break
+    return result
 
 # ---- profile parsing --------------------------------------------------------
 
@@ -519,6 +536,7 @@ def make_handler(runner, store):
             if not conf.is_file():
                 return self._send_json({"ok": False, "error": "no such profile"}, 404)
             args, port, meta = parse_profile(conf)
+            args = _resolve_model_args(args, cfg)
             profile_type = meta.get("type", "llama")
             if profile_type not in ("llama", "sd"):
                 return self._send_json(

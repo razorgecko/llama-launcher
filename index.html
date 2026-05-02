@@ -261,6 +261,7 @@ const FIELD_META = {
   llama_bin:              { label: "llama-server binary",        type: "text",  hint: "Command or absolute path to llama-server." },
   sd_bin:                 { label: "stable-diffusion binary",   type: "text",  hint: "Command or absolute path to sd-server (stable-diffusion.cpp)." },
   profiles_dir:           { label: "Profiles directory", type: "text",   hint: "Relative paths are resolved next to the script." },
+  models_dir:             { label: "Models directory",   type: "text",   hint: "Base directory for --model values starting with ./  (e.g. ./llm/model.gguf). Leave empty to disable." },
   open_browser_on_launch: { label: "Open browser when launcher starts", type: "checkbox" },
   auto_open_model_ui:     { label: "Open model UI tab when starting a profile", type: "checkbox" },
 };
