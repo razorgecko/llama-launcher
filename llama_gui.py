@@ -651,7 +651,7 @@ def make_handler(runner, store):
             # Hold runner.lock so the running-profile check and the unlink
             # are atomic with respect to /api/start.
             with runner.lock:
-                if runner.proc and runner.profile_name == name:
+                if runner.proc and runner.proc.poll() is None and runner.profile_name == name:
                     return self._send_json(
                         {"ok": False, "error": "cannot delete a running profile"}, 409)
                 if not conf.exists():
