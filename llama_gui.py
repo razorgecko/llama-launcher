@@ -3,6 +3,7 @@
 import collections
 import http.server
 import json
+import logging
 import os
 import re
 import shlex
@@ -14,6 +15,7 @@ import threading
 import time
 import urllib.request
 import webbrowser
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -21,9 +23,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 INDEX_PATH = SCRIPT_DIR / "index.html"
 
 _XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+_XDG_DATA_HOME   = Path(os.environ.get("XDG_DATA_HOME")   or Path.home() / ".local" / "share")
 
 CONFIG_PATH = _XDG_CONFIG_HOME / "llama-launcher" / "config.json"
 STATE_PATH  = _XDG_CONFIG_HOME / "llama-launcher" / "state.json"
+LOG_PATH    = _XDG_DATA_HOME   / "llama-launcher" / "launcher.log"
 
 DEFAULT_CONFIG = {
     "port": 7777,
@@ -79,7 +83,7 @@ def load_config():
         try:
             cfg = json.loads(CONFIG_PATH.read_text())
         except json.JSONDecodeError as e:
-            print(f"warning: config.json is invalid ({e}); using defaults", file=sys.stderr)
+            logging.warning("config.json is invalid (%s); using defaults", e)
             return dict(DEFAULT_CONFIG)
         merged = dict(DEFAULT_CONFIG)
         merged.update({k: v for k, v in cfg.items() if k in DEFAULT_CONFIG})
@@ -117,7 +121,7 @@ class StateStore:
         try:
             s = json.loads(self.path.read_text())
         except json.JSONDecodeError as e:
-            print(f"warning: {self.path.name} is invalid ({e}); resetting", file=sys.stderr)
+            logging.warning("%s is invalid (%s); resetting", self.path.name, e)
             return {"last_used": None, "favorites": []}
         return {
             "last_used": s.get("last_used") if isinstance(s.get("last_used"), str) else None,
@@ -377,7 +381,7 @@ def make_handler(runner, store):
             "/api/quit":       "_post_quit",
         }
 
-        def log_message(self, *a): pass
+        def log_message(self, format, *a): pass
 
         def _send(self, code, ctype, body):
             if isinstance(body, str):
@@ -705,7 +709,16 @@ class ReusableTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+def _setup_logging():
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(LOG_PATH, maxBytes=512 * 1024, backupCount=2)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
+
 def main():
+    _setup_logging()
     cfg = load_config()
     if (not _is_loopback(cfg["host"])
             and not os.environ.get("LLAMA_LAUNCHER_ALLOW_REMOTE")):
@@ -721,9 +734,10 @@ def main():
         sys.exit(f"missing {INDEX_PATH}")
 
     url = f"http://{cfg['host']}:{cfg['port']}"
-    print(f"→ launcher GUI at {url}")
-    print(f"  profiles: {profiles_dir}")
-    print(f"  binary:   {llama_bin(cfg)}")
+    logging.info("→ launcher GUI at %s", url)
+    logging.info("  profiles: %s", profiles_dir)
+    logging.info("  binary:   %s", llama_bin(cfg))
+    logging.info("  log:      %s", LOG_PATH)
 
     if cfg["open_browser_on_launch"]:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
@@ -736,7 +750,7 @@ def main():
         with ReusableTCPServer((cfg["host"], cfg["port"]), handler_cls) as srv:
             srv.serve_forever()
     except KeyboardInterrupt:
-        print("\nshutting down")
+        logging.info("shutting down")
         runner.stop()
 
 if __name__ == "__main__":
