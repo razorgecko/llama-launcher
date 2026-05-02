@@ -55,12 +55,7 @@
   button.btn.secondary { color: var(--accent); border-color: var(--accent); }
   button.btn.secondary:hover { background: var(--accent-bg); }
 
-  #status {
-    margin-top: 1rem; padding: .6rem .9rem;
-    background: white; border: 1px solid var(--border); border-radius: 6px;
-    font-family: ui-monospace, monospace; font-size: .85rem; color: var(--muted);
-  }
-  .empty { color: var(--muted); padding: 1rem; text-align: center; font-style: italic; }
+.empty { color: var(--muted); padding: 1rem; text-align: center; font-style: italic; }
 
   .section-header {
     margin: 1.2rem 0 .3rem; padding: 0 .2rem;
@@ -221,7 +216,6 @@
     <input id="profile-search" type="search" placeholder="Filter profiles…" oninput="applyFilter()">
   </div>
   <div id="list"><div class="empty">loading…</div></div>
-  <div id="status">…</div>
 </section>
 
 <section id="panel-logs" class="panel">
@@ -543,12 +537,6 @@ async function refreshState() {
 
   _lastState = s;
   renderProfiles(s);
-
-  const runningProfile = s.profiles.find(p => p.id === s.running);
-  const runningLabel = runningProfile ? runningProfile.name : s.running;
-  const statusVerb = s.running ? (s.ready ? "running" : "loading…") : null;
-  document.getElementById("status").textContent =
-    s.running ? `${statusVerb}: ${runningLabel}${s.port ? ` (port ${s.port})` : ""}` : "idle";
 
   window._autoOpen = s.auto_open_model_ui;
 
