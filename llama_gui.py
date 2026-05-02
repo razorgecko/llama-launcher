@@ -161,21 +161,6 @@ def sd_bin(cfg):
     b = cfg["sd_bin"]
     return str(Path(b).expanduser()) if "~" in b or "/" in b else b
 
-def _resolve_model_args(args, cfg):
-    """Resolve --model values starting with ./ against models_dir.
-    Anything else (absolute path, ~, plain name) is left untouched."""
-    mdir_str = cfg.get("models_dir", "")
-    if not mdir_str:
-        return args
-    mdir = Path(mdir_str).expanduser()
-    result = list(args)
-    for i, token in enumerate(result):
-        if token == "--model" and i + 1 < len(result):
-            val = result[i + 1]
-            if val.startswith("./"):
-                result[i + 1] = str(mdir / val)
-            break
-    return result
 
 # ---- profile parsing --------------------------------------------------------
 
@@ -193,7 +178,7 @@ def _parse_meta_line(line):
         return key, value
     return None
 
-def parse_profile(path, meta_only=False):
+def parse_profile(path, meta_only=False, models_dir=""):
     """Return (args, port, meta) from a .conf file.
 
     - Comments starting with # are stripped from arg parsing.
@@ -201,9 +186,11 @@ def parse_profile(path, meta_only=False):
       into the meta dict (keys: name, description). They must appear on their
       own line, anywhere in the file. First occurrence wins.
     - Tokens starting with ~ are expanded to the user's home directory.
+    - Tokens starting with ./ are resolved against models_dir (if set).
     - With meta_only=True, skips arg parsing and returns early once all
       META_KEYS are found (used by read_profile_meta for cheap listing polls).
     """
+    mdir = Path(models_dir).expanduser() if models_dir else None
     args, port, meta = [], None, {}
     with path.open() as f:
         for line in f:
@@ -220,7 +207,9 @@ def parse_profile(path, meta_only=False):
             if meta_only:
                 continue
             tokens = [
-                os.path.expanduser(t) if t.startswith("~") else t
+                os.path.expanduser(t) if t.startswith("~")
+                else str(mdir / t) if (t.startswith("./") and mdir)
+                else t
                 for t in shlex.split(stripped)
             ]
             args += tokens
@@ -535,8 +524,7 @@ def make_handler(runner, store):
             conf = profiles_path(cfg) / f"{name}.conf"
             if not conf.is_file():
                 return self._send_json({"ok": False, "error": "no such profile"}, 404)
-            args, port, meta = parse_profile(conf)
-            args = _resolve_model_args(args, cfg)
+            args, port, meta = parse_profile(conf, models_dir=cfg.get("models_dir", ""))
             profile_type = meta.get("type", "llama")
             if profile_type not in ("llama", "sd"):
                 return self._send_json(
