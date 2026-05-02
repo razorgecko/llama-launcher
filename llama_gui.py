@@ -32,6 +32,9 @@ DEFAULT_CONFIG = {
 # Fields that require a restart to take effect.
 RESTART_FIELDS = {"port", "host"}
 
+# llama-server listens on this port when --port is not specified.
+LLAMA_DEFAULT_PORT = 8080
+
 # ---- config -----------------------------------------------------------------
 
 _cfg_lock = threading.RLock()
@@ -308,17 +311,15 @@ class Runner:
                 errors="replace",
             )
             self.profile_name = name
-            self.profile_port = port
+            poll_port = port or LLAMA_DEFAULT_PORT
+            self.profile_port = poll_port
             for stream_name, fh in (("out", self.proc.stdout), ("err", self.proc.stderr)):
                 t = threading.Thread(
                     target=self._reader, args=(stream_name, fh), daemon=True)
                 t.start()
-            if port:
-                t = threading.Thread(
-                    target=self._health_poller, args=(port, self.proc), daemon=True)
-                t.start()
-            else:
-                self._ready = True  # no port to poll; assume ready
+            t = threading.Thread(
+                target=self._health_poller, args=(poll_port, self.proc), daemon=True)
+            t.start()
 
     def stop(self):
         with self.lock:
@@ -548,8 +549,15 @@ def make_handler(runner, store):
                     return self._send_json({"ok": False, "error": "invalid new filename"}, 400)
             cfg = load_config()
             dest_name = new_name if new_name and new_name != name else name
+            with runner.lock:
+                if (runner.proc and runner.proc.poll() is None
+                        and runner.profile_name in (name, dest_name)):
+                    return self._send_json(
+                        {"ok": False, "error": "cannot edit a running profile"}, 409)
             old_conf = profiles_path(cfg) / f"{name}.conf"
             new_conf = profiles_path(cfg) / f"{dest_name}.conf"
+            if body.get("is_new") and new_conf.exists():
+                return self._send_json({"ok": False, "error": "a profile with that filename already exists"}, 409)
             if new_conf != old_conf and new_conf.exists():
                 return self._send_json({"ok": False, "error": "a profile with that filename already exists"}, 409)
             tmp = new_conf.with_suffix(".conf.tmp")
