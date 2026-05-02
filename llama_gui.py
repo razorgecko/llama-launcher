@@ -276,7 +276,7 @@ class Runner:
             self.logs.append({
                 "idx": self._next_idx,
                 "stream": stream,
-                "text": text.rstrip("\n"),
+                "text": re.sub(r"\x1b\[[0-9;]*[A-Za-z]|\r", "", text.rstrip("\n")),
             })
             self._next_idx += 1
 
