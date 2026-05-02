@@ -246,8 +246,8 @@
     </div>
     <textarea id="editor-content" spellcheck="false"></textarea>
     <div class="modal-actions">
-      <button class="btn primary" onclick="saveProfile()">Save</button>
-      <button class="btn" onclick="closeEditor()">Cancel</button>
+      <button id="editor-save-btn" class="btn primary" onclick="saveProfile()">Save</button>
+      <button id="editor-cancel-btn" class="btn" onclick="closeEditor()">Cancel</button>
       <span id="editor-msg"></span>
     </div>
   </div>
@@ -433,11 +433,11 @@ function profileRow(p, s, opts = {}) {
   const menuDrop = document.createElement("div");
   menuDrop.className = "menu-dropdown";
   const editItem = document.createElement("button");
-  editItem.textContent = "Edit";
   if (isRunning) {
-    editItem.disabled = true;
-    editItem.innerHTML = "Edit<br><span class='stop-hint'>(stop first)</span>";
+    editItem.textContent = "View";
+    editItem.onclick = () => { closeDrop(); openEditor(p.id, p.name, true); };
   } else {
+    editItem.textContent = "Edit";
     editItem.onclick = () => { closeDrop(); openEditor(p.id, p.name); };
   }
   const copyItem = document.createElement("button");
@@ -640,9 +640,19 @@ async function saveSettings(ev) {
 
 // --- profile editor ---
 let editingProfile = null;
+let _editorViewOnly = false;
+
+function _setEditorViewOnly(viewOnly) {
+  _editorViewOnly = viewOnly;
+  document.getElementById("editor-save-btn").style.display = viewOnly ? "none" : "";
+  document.getElementById("editor-cancel-btn").textContent = viewOnly ? "Close" : "Cancel";
+  document.getElementById("editor-content").readOnly = viewOnly;
+  document.getElementById("editor-filename").readOnly = viewOnly;
+}
 
 function openNewEditor() {
   editingProfile = null;
+  _setEditorViewOnly(false);
   document.getElementById("editor-title").textContent = "New profile";
   document.getElementById("editor-filename").value = "profile-id";
   document.getElementById("editor-content").value =
@@ -654,9 +664,10 @@ function openNewEditor() {
   document.getElementById("editor-filename").select();
 }
 
-async function openEditor(id, name) {
+async function openEditor(id, name, viewOnly = false) {
   editingProfile = id;
-  document.getElementById("editor-title").textContent = `Edit: ${name}`;
+  _setEditorViewOnly(viewOnly);
+  document.getElementById("editor-title").textContent = viewOnly ? `View: ${name}` : `Edit: ${name}`;
   document.getElementById("editor-filename").value = id;
   const ta = document.getElementById("editor-content");
   const msg = document.getElementById("editor-msg");
@@ -664,7 +675,7 @@ async function openEditor(id, name) {
   document.getElementById("modal-backdrop").classList.add("open");
   try {
     const j = await (await fetch(`/api/profile?profile=${encodeURIComponent(id)}`)).json();
-    if (j.ok) { ta.value = j.content; msg.textContent = ""; ta.focus(); }
+    if (j.ok) { ta.value = j.content; msg.textContent = ""; if (!viewOnly) ta.focus(); }
     else { msg.className = "err"; msg.textContent = j.error || "load failed"; }
   } catch { msg.className = "err"; msg.textContent = "load failed"; }
 }
@@ -672,9 +683,11 @@ async function openEditor(id, name) {
 function closeEditor() {
   document.getElementById("modal-backdrop").classList.remove("open");
   editingProfile = null;
+  _setEditorViewOnly(false);
 }
 
 async function saveProfile() {
+  if (_editorViewOnly) return;
   const content = document.getElementById("editor-content").value;
   const newName = document.getElementById("editor-filename").value.trim();
   const msg = document.getElementById("editor-msg");
