@@ -258,7 +258,8 @@
 const FIELD_META = {
   port:                   { label: "Launcher port",      type: "number", hint: "Port for this GUI." },
   host:                   { label: "Launcher host",      type: "text",   hint: "Bind address. 127.0.0.1 = local only." },
-  llama_bin:              { label: "llama-server binary", type: "text",  hint: "Command or absolute path to llama-server." },
+  llama_bin:              { label: "llama-server binary",        type: "text",  hint: "Command or absolute path to llama-server." },
+  sd_bin:                 { label: "stable-diffusion binary",   type: "text",  hint: "Command or absolute path to sd-server (stable-diffusion.cpp)." },
   profiles_dir:           { label: "Profiles directory", type: "text",   hint: "Relative paths are resolved next to the script." },
   open_browser_on_launch: { label: "Open browser when launcher starts", type: "checkbox" },
   auto_open_model_ui:     { label: "Open model UI tab when starting a profile", type: "checkbox" },

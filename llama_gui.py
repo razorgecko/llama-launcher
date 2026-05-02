@@ -33,6 +33,7 @@ DEFAULT_CONFIG = {
     "port": 7777,
     "host": "127.0.0.1",
     "llama_bin": "llama-server",
+    "sd_bin": "sd-server",
     "profiles_dir": str(_XDG_CONFIG_HOME / "llama-launcher" / "profiles"),
     "open_browser_on_launch": True,
     "auto_open_model_ui": False,
@@ -54,7 +55,7 @@ LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 def _is_loopback(host):
     return host in LOOPBACK_HOSTS
 
-def _validate_llama_bin(value):
+def _validate_binary(value):
     """True if `value` resolves to an executable file (PATH lookup or path)."""
     expanded = os.path.expanduser(value)
     if "/" in expanded:
@@ -154,9 +155,13 @@ def llama_bin(cfg):
     b = cfg["llama_bin"]
     return str(Path(b).expanduser()) if "~" in b or "/" in b else b
 
+def sd_bin(cfg):
+    b = cfg["sd_bin"]
+    return str(Path(b).expanduser()) if "~" in b or "/" in b else b
+
 # ---- profile parsing --------------------------------------------------------
 
-META_KEYS = ("name", "description")
+META_KEYS = ("name", "description", "type")
 META_RE = re.compile(r"^#\s*(\w+)\s*:\s*(.*)$")
 
 def _parse_meta_line(line):
@@ -319,7 +324,7 @@ class Runner:
                 pass
             time.sleep(0.5)
 
-    def start(self, name, args, port, binary):
+    def start(self, name, args, port, binary, skip_health=False):
         with self.lock:
             self._terminate_locked()
             self._ready = False
@@ -340,9 +345,12 @@ class Runner:
                 t = threading.Thread(
                     target=self._reader, args=(stream_name, fh), daemon=True)
                 t.start()
-            t = threading.Thread(
-                target=self._health_poller, args=(poll_port, self.proc), daemon=True)
-            t.start()
+            if skip_health:
+                self._ready = True
+            else:
+                t = threading.Thread(
+                    target=self._health_poller, args=(poll_port, self.proc), daemon=True)
+                t.start()
 
     def stop(self):
         with self.lock:
@@ -511,13 +519,18 @@ def make_handler(runner, store):
             conf = profiles_path(cfg) / f"{name}.conf"
             if not conf.is_file():
                 return self._send_json({"ok": False, "error": "no such profile"}, 404)
-            args, port, _meta = parse_profile(conf)
+            args, port, meta = parse_profile(conf)
+            profile_type = meta.get("type", "llama")
+            if profile_type not in ("llama", "sd"):
+                return self._send_json(
+                    {"ok": False, "error": f"unknown profile type: {profile_type!r}"}, 400)
+            binary = sd_bin(cfg) if profile_type == "sd" else llama_bin(cfg)
             # Record last_used since the user explicitly chose this profile.
             store.update(lambda s: s.update({"last_used": name}))
             try:
-                runner.start(name, args, port, llama_bin(cfg))
+                runner.start(name, args, port, binary, skip_health=(profile_type == "sd"))
             except FileNotFoundError:
-                msg = f"binary not found: {llama_bin(cfg)}"
+                msg = f"binary not found: {binary}"
                 runner._emit("system", f"ERROR: {msg}")
                 return self._send_json({"ok": False, "error": msg}, 500)
             self._send_json({"ok": True, "port": port})
@@ -581,10 +594,15 @@ def make_handler(runner, store):
                     {"ok": False, "error":
                      "non-loopback host requires LLAMA_LAUNCHER_ALLOW_REMOTE=1 "
                      "(every endpoint is unauthenticated)"}, 400)
-            if not _validate_llama_bin(updated["llama_bin"]):
+            if not _validate_binary(updated["llama_bin"]):
                 return self._send_json(
                     {"ok": False, "error":
                      f"llama_bin {updated['llama_bin']!r} is not an executable"}, 400)
+            if (updated["sd_bin"] != cfg["sd_bin"]
+                    and not _validate_binary(updated["sd_bin"])):
+                return self._send_json(
+                    {"ok": False, "error":
+                     f"sd_bin {updated['sd_bin']!r} is not an executable"}, 400)
             save_config(updated)
             needs_restart = any(updated[k] != cfg[k] for k in RESTART_FIELDS)
             self._send_json({"ok": True, "needs_restart": needs_restart})
@@ -736,7 +754,8 @@ def main():
     url = f"http://{cfg['host']}:{cfg['port']}"
     logging.info("→ launcher GUI at %s", url)
     logging.info("  profiles: %s", profiles_dir)
-    logging.info("  binary:   %s", llama_bin(cfg))
+    logging.info("  llama-bin: %s", llama_bin(cfg))
+    logging.info("  sd-bin:    %s", sd_bin(cfg))
     logging.info("  log:      %s", LOG_PATH)
 
     if cfg["open_browser_on_launch"]:
