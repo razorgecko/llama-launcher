@@ -18,14 +18,18 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = SCRIPT_DIR / "config.json"
 INDEX_PATH = SCRIPT_DIR / "index.html"
+
+_XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+
+CONFIG_PATH = _XDG_CONFIG_HOME / "llama-launcher" / "config.json"
+STATE_PATH  = _XDG_CONFIG_HOME / "llama-launcher" / "state.json"
 
 DEFAULT_CONFIG = {
     "port": 7777,
     "host": "127.0.0.1",
     "llama_bin": "llama-server",
-    "profiles_dir": "./profiles",
+    "profiles_dir": str(_XDG_CONFIG_HOME / "llama-launcher" / "profiles"),
     "open_browser_on_launch": True,
     "auto_open_model_ui": False,
 }
@@ -86,6 +90,7 @@ def load_config():
 def save_config(cfg):
     """Atomic write so a crash mid-write doesn't corrupt the file."""
     global _cfg_cache, _cfg_mtime
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = CONFIG_PATH.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(cfg, indent=2) + "\n")
     os.replace(tmp, CONFIG_PATH)
@@ -97,8 +102,6 @@ def save_config(cfg):
             _cfg_mtime = 0.0
 
 # ---- user state (favorites, last_used) -------------------------------------
-
-STATE_PATH = SCRIPT_DIR / "state.json"
 
 class StateStore:
     """Thread-safe storage for user state (favorites, last_used).
@@ -122,6 +125,7 @@ class StateStore:
         }
 
     def save(self, s):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(s, indent=2) + "\n")
         os.replace(tmp, self.path)
@@ -446,6 +450,10 @@ def make_handler(runner, store):
             us = store.load()
             last_used = us["last_used"] if us["last_used"] in valid_ids else None
             favorites = [f for f in us["favorites"] if f in valid_ids]
+            if last_used != us["last_used"] or favorites != us["favorites"]:
+                store.update(lambda s: (
+                    s.update({"last_used": last_used, "favorites": favorites})
+                ))
             self._send_json({
                 "profiles": profiles,
                 "running": runner.profile_name if running else None,

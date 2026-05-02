@@ -1,5 +1,3 @@
-# Configuration
-config.json
-
-# Profiles
-profiles/
+# Python compilation files
+__pycache__/
+*.py[codz]
