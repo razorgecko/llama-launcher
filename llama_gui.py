@@ -349,8 +349,10 @@ def make_handler(runner, store):
             "/api/favorite":   "_post_favorite",
             "/api/move":       "_post_move",
             "/api/config":     "_post_config",
-            "/api/profile":    "_post_profile",
-            "/api/logs/clear": "_post_logs_clear",
+            "/api/profile":        "_post_profile",
+            "/api/profile/copy":   "_post_profile_copy",
+            "/api/profile/delete": "_post_profile_delete",
+            "/api/logs/clear":     "_post_logs_clear",
             "/api/quit":       "_post_quit",
         }
 
@@ -540,14 +542,79 @@ def make_handler(runner, store):
             body = self._read_json()
             if body is None or not isinstance(body.get("content"), str):
                 return self._send_json({"ok": False, "error": "missing content"}, 400)
+            new_name = body.get("new_name")
+            if new_name is not None:
+                if not isinstance(new_name, str) or not _valid_profile_id(new_name):
+                    return self._send_json({"ok": False, "error": "invalid new filename"}, 400)
             cfg = load_config()
-            conf = profiles_path(cfg) / f"{name}.conf"
-            tmp = conf.with_suffix(".conf.tmp")
+            dest_name = new_name if new_name and new_name != name else name
+            old_conf = profiles_path(cfg) / f"{name}.conf"
+            new_conf = profiles_path(cfg) / f"{dest_name}.conf"
+            if new_conf != old_conf and new_conf.exists():
+                return self._send_json({"ok": False, "error": "a profile with that filename already exists"}, 409)
+            tmp = new_conf.with_suffix(".conf.tmp")
             try:
                 tmp.write_text(body["content"])
-                os.replace(tmp, conf)
+                os.replace(tmp, new_conf)
+                if new_conf != old_conf:
+                    old_conf.unlink(missing_ok=True)
             except OSError as e:
                 return self._send_json({"ok": False, "error": str(e)}, 500)
+            if new_conf != old_conf:
+                def rename_refs(s):
+                    if s.get("last_used") == name:
+                        s["last_used"] = dest_name
+                    if name in s["favorites"]:
+                        i = s["favorites"].index(name)
+                        s["favorites"][i] = dest_name
+                store.update(rename_refs)
+            self._send_json({"ok": True})
+
+        def _post_profile_copy(self):
+            name = self._qs.get("profile", [""])[0]
+            if not _valid_profile_id(name):
+                return self._send_json({"ok": False, "error": "invalid profile id"}, 400)
+            cfg = load_config()
+            src = profiles_path(cfg) / f"{name}.conf"
+            if not src.exists():
+                return self._send_json({"ok": False, "error": "no such profile"}, 404)
+            # Find a unique destination name: "name-copy", "name-copy-2", …
+            base = f"{name}-copy"
+            new_name = base
+            counter = 2
+            while (profiles_path(cfg) / f"{new_name}.conf").exists():
+                new_name = f"{base}-{counter}"
+                counter += 1
+            dst = profiles_path(cfg) / f"{new_name}.conf"
+            try:
+                dst.write_text(src.read_text())
+            except OSError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 500)
+            self._send_json({"ok": True, "new_profile": new_name})
+
+        def _post_profile_delete(self):
+            name = self._qs.get("profile", [""])[0]
+            if not _valid_profile_id(name):
+                return self._send_json({"ok": False, "error": "invalid profile id"}, 400)
+            with runner.lock:
+                if runner.proc and runner.profile_name == name:
+                    return self._send_json(
+                        {"ok": False, "error": "cannot delete a running profile"}, 409)
+            cfg = load_config()
+            conf = profiles_path(cfg) / f"{name}.conf"
+            if not conf.exists():
+                return self._send_json({"ok": False, "error": "no such profile"}, 404)
+            try:
+                conf.unlink()
+            except OSError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 500)
+            # Remove from favorites / last_used so stale ids don't linger.
+            def cleanup(s):
+                if name in s["favorites"]:
+                    s["favorites"].remove(name)
+                if s.get("last_used") == name:
+                    s["last_used"] = None
+            store.update(cleanup)
             self._send_json({"ok": True})
 
         def _post_logs_clear(self):

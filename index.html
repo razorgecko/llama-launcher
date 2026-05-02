@@ -52,6 +52,8 @@
   button.btn:hover { background: #f0f0f0; }
   button.btn.primary { background: var(--fg); color: white; border-color: var(--fg); }
   button.btn.primary:hover { background: #444; }
+  button.btn.secondary { color: var(--accent); border-color: var(--accent); }
+  button.btn.secondary:hover { background: var(--accent-bg); }
 
   #status {
     margin-top: 1rem; padding: .6rem .9rem;
@@ -83,6 +85,28 @@
     background: #e3f2fd; color: #0d47a1; border-radius: 3px;
     margin-left: .5rem; vertical-align: middle; font-weight: normal;
   }
+  .row .menu-wrap { position: relative; }
+  .row .menu-btn {
+    background: none; border: 1px solid var(--border); padding: .15rem .45rem;
+    cursor: pointer; font-size: 1rem; color: var(--muted);
+    border-radius: 3px; line-height: 1;
+  }
+  .row .menu-btn:hover { background: #f0f0f0; color: var(--fg); }
+  .row .menu-dropdown {
+    display: none; position: absolute; right: 0; top: calc(100% + 3px);
+    background: white; border: 1px solid var(--border); border-radius: 4px;
+    box-shadow: 0 2px 8px rgba(0,0,0,.12); min-width: 120px; z-index: 100;
+  }
+  .row .menu-dropdown.open { display: block; }
+  .row .menu-dropdown button {
+    display: block; width: 100%; text-align: left;
+    background: none; border: none; padding: .45rem .75rem;
+    cursor: pointer; font-size: .9em; color: var(--fg);
+  }
+  .row .menu-dropdown button:hover { background: #f5f5f5; }
+  .row .menu-dropdown button.danger { color: #c62828; }
+  .row .menu-dropdown button.danger:hover { background: #ffebee; }
+  .row .menu-dropdown hr { margin: .2rem 0; border: none; border-top: 1px solid var(--border); }
 
   /* settings */
   .field { margin: .8rem 0; }
@@ -135,10 +159,11 @@
   button.btn.danger:hover { background: #b71c1c; }
 
   /* profile search */
+  .profiles-toolbar { display: flex; gap: .5rem; margin-bottom: .5rem; }
   #profile-search {
-    width: 100%; padding: .4rem .6rem; font-size: .95rem;
+    flex: 1; padding: .4rem .6rem; font-size: .95rem;
     border: 1px solid var(--border); border-radius: 4px;
-    margin-bottom: .5rem; background: white; color: var(--fg);
+    background: white; color: var(--fg);
   }
 
   /* profile editor modal */
@@ -155,6 +180,14 @@
     box-shadow: 0 4px 24px rgba(0,0,0,.2);
   }
   .modal h3 { margin: 0; font-size: 1rem; }
+  .modal .filename-row { display: flex; align-items: center; gap: .5rem; font-size: .9em; }
+  .modal .filename-row label { color: var(--muted); white-space: nowrap; }
+  .modal .filename-row input {
+    flex: 1; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: .88rem; padding: .3rem .5rem;
+    border: 1px solid var(--border); border-radius: 4px;
+  }
+  .modal .filename-row .ext { color: var(--muted); }
   .modal textarea {
     flex: 1; min-height: 280px;
     font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -180,7 +213,10 @@
 </nav>
 
 <section id="panel-profiles" class="panel active">
-  <input id="profile-search" type="search" placeholder="Filter profiles…" oninput="applyFilter()">
+  <div class="profiles-toolbar">
+    <button class="btn secondary" onclick="openNewEditor()">+ New</button>
+    <input id="profile-search" type="search" placeholder="Filter profiles…" oninput="applyFilter()">
+  </div>
   <div id="list"><div class="empty">loading…</div></div>
   <div id="status">…</div>
 </section>
@@ -206,6 +242,11 @@
 <div id="modal-backdrop" class="modal-backdrop">
   <div class="modal">
     <h3 id="editor-title">Edit profile</h3>
+    <div class="filename-row">
+      <label for="editor-filename">Filename</label>
+      <input id="editor-filename" type="text" spellcheck="false">
+      <span class="ext">.conf</span>
+    </div>
     <textarea id="editor-content" spellcheck="false"></textarea>
     <div class="modal-actions">
       <button class="btn primary" onclick="saveProfile()">Save</button>
@@ -334,7 +375,7 @@ function profileRow(p, s, opts = {}) {
   const nameEl = document.createElement("div");
   nameEl.className = "name";
   nameEl.textContent = p.name;
-  if (isLastUsed) {
+  if (isLastUsed && !isRunning) {
     const badge = document.createElement("span");
     badge.className = "last-used-badge";
     badge.textContent = "last used";
@@ -388,11 +429,32 @@ function profileRow(p, s, opts = {}) {
     actions.appendChild(link);
   }
 
-  const editBtn = document.createElement("button");
-  editBtn.className = "btn";
-  editBtn.textContent = "Edit";
-  editBtn.onclick = () => openEditor(p.id, p.name);
-  actions.appendChild(editBtn);
+  const menuWrap = document.createElement("span");
+  menuWrap.className = "menu-wrap";
+  const menuBtn = document.createElement("button");
+  menuBtn.className = "menu-btn"; menuBtn.textContent = "⋮"; menuBtn.title = "More options";
+  const menuDrop = document.createElement("div");
+  menuDrop.className = "menu-dropdown";
+  const editItem = document.createElement("button");
+  editItem.textContent = "Edit";
+  editItem.onclick = () => { closeDrop(); openEditor(p.id, p.name); };
+  const copyItem = document.createElement("button");
+  copyItem.textContent = "Copy";
+  copyItem.onclick = () => { closeDrop(); copyAction(p.id); };
+  const hr = document.createElement("hr");
+  const deleteItem = document.createElement("button");
+  deleteItem.textContent = "Delete"; deleteItem.className = "danger";
+  deleteItem.onclick = () => { closeDrop(); deleteAction(p.id, p.name); };
+  menuDrop.append(editItem, copyItem, hr, deleteItem);
+  menuWrap.append(menuBtn, menuDrop);
+  function closeDrop() { menuDrop.classList.remove("open"); }
+  menuBtn.onclick = (e) => {
+    e.stopPropagation();
+    const wasOpen = menuDrop.classList.contains("open");
+    document.querySelectorAll(".menu-dropdown.open").forEach(d => d.classList.remove("open"));
+    if (!wasOpen) menuDrop.classList.add("open");
+  };
+  actions.appendChild(menuWrap);
 
   const btn = document.createElement("button");
   btn.className = "btn" + (isRunning ? "" : " primary");
@@ -405,6 +467,7 @@ function profileRow(p, s, opts = {}) {
 }
 
 function renderProfiles(s) {
+  if (document.querySelector(".menu-dropdown.open")) return;
   const query = document.getElementById("profile-search").value.trim().toLowerCase();
   const list = document.getElementById("list");
   list.innerHTML = "";
@@ -502,6 +565,23 @@ async function moveAction(id, direction) {
   refreshState();
 }
 
+async function copyAction(id) {
+  const r = await (await fetch(`/api/profile/copy?profile=${encodeURIComponent(id)}`, { method: "POST" })).json();
+  if (!r.ok) { alert("Copy failed: " + r.error); return; }
+  refreshState();
+}
+
+async function deleteAction(id, name) {
+  if (!confirm(`Delete profile "${name}"? This cannot be undone.`)) return;
+  const r = await (await fetch(`/api/profile/delete?profile=${encodeURIComponent(id)}`, { method: "POST" })).json();
+  if (!r.ok) { alert("Delete failed: " + r.error); return; }
+  refreshState();
+}
+
+// Close any open dropdown when clicking outside.
+document.addEventListener("click", () =>
+  document.querySelectorAll(".menu-dropdown.open").forEach(d => d.classList.remove("open")));
+
 // --- settings panel ---
 async function loadSettings() {
   const r = await (await fetch("/api/config")).json();
@@ -559,9 +639,23 @@ async function saveSettings(ev) {
 // --- profile editor ---
 let editingProfile = null;
 
+function openNewEditor() {
+  editingProfile = null;
+  document.getElementById("editor-title").textContent = "New profile";
+  document.getElementById("editor-filename").value = "profile-id";
+  document.getElementById("editor-content").value =
+    "# name: \n# description: \n\n# Execution parameters\n--model ";
+  document.getElementById("editor-msg").className = "";
+  document.getElementById("editor-msg").textContent = "";
+  document.getElementById("modal-backdrop").classList.add("open");
+  document.getElementById("editor-filename").focus();
+  document.getElementById("editor-filename").select();
+}
+
 async function openEditor(id, name) {
   editingProfile = id;
   document.getElementById("editor-title").textContent = `Edit: ${name}`;
+  document.getElementById("editor-filename").value = id;
   const ta = document.getElementById("editor-content");
   const msg = document.getElementById("editor-msg");
   ta.value = ""; msg.className = ""; msg.textContent = "loading…";
@@ -579,15 +673,20 @@ function closeEditor() {
 }
 
 async function saveProfile() {
-  if (!editingProfile) return;
   const content = document.getElementById("editor-content").value;
+  const newName = document.getElementById("editor-filename").value.trim();
   const msg = document.getElementById("editor-msg");
+  if (!newName) { msg.className = "err"; msg.textContent = "filename cannot be empty"; return; }
   msg.className = ""; msg.textContent = "saving…";
+  const isNew = editingProfile === null;
+  const targetId = isNew ? newName : editingProfile;
+  const body = { content };
+  if (!isNew && newName !== editingProfile) body.new_name = newName;
   try {
-    const r = await fetch(`/api/profile?profile=${encodeURIComponent(editingProfile)}`, {
+    const r = await fetch(`/api/profile?profile=${encodeURIComponent(targetId)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify(body),
     });
     const j = await r.json();
     if (j.ok) {
