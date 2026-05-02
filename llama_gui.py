@@ -42,8 +42,9 @@ DEFAULT_CONFIG = {
 # Fields that require a restart to take effect.
 RESTART_FIELDS = {"port", "host"}
 
-# llama-server listens on this port when --port is not specified.
+# Default ports when --port / --listen-port is not specified in the profile.
 LLAMA_DEFAULT_PORT = 8080
+SD_DEFAULT_PORT = 1234
 
 # Hosts considered safe to bind without authentication. Anything else requires
 # the user to set LLAMA_LAUNCHER_ALLOW_REMOTE=1 — see the guard in main() and
@@ -206,11 +207,13 @@ def parse_profile(path, meta_only=False):
                 for t in shlex.split(stripped)
             ]
             args += tokens
-            if "--port" in tokens:
-                try:
-                    port = int(tokens[tokens.index("--port") + 1])
-                except (IndexError, ValueError):
-                    pass
+            for port_flag in ("--port", "--listen-port"):
+                if port_flag in tokens:
+                    try:
+                        port = int(tokens[tokens.index(port_flag) + 1])
+                    except (IndexError, ValueError):
+                        pass
+                    break
     return args, port, meta
 
 def read_profile_meta(path):
@@ -306,9 +309,9 @@ class Runner:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
 
-    def _health_poller(self, port, proc):
-        """Poll /health until 200 or process exits (5-minute timeout)."""
-        url = f"http://127.0.0.1:{port}/health"
+    def _health_poller(self, port, proc, path="/health"):
+        """Poll health endpoint until 200 or process exits (5-minute timeout)."""
+        url = f"http://127.0.0.1:{port}{path}"
         deadline = time.monotonic() + 300
         while time.monotonic() < deadline:
             if proc.poll() is not None:
@@ -324,7 +327,7 @@ class Runner:
                 pass
             time.sleep(0.5)
 
-    def start(self, name, args, port, binary, skip_health=False):
+    def start(self, name, args, port, binary, health_path="/health"):
         with self.lock:
             self._terminate_locked()
             self._ready = False
@@ -339,18 +342,14 @@ class Runner:
                 errors="replace",
             )
             self.profile_name = name
-            poll_port = port or LLAMA_DEFAULT_PORT
-            self.profile_port = poll_port
+            self.profile_port = port
             for stream_name, fh in (("out", self.proc.stdout), ("err", self.proc.stderr)):
                 t = threading.Thread(
                     target=self._reader, args=(stream_name, fh), daemon=True)
                 t.start()
-            if skip_health:
-                self._ready = True
-            else:
-                t = threading.Thread(
-                    target=self._health_poller, args=(poll_port, self.proc), daemon=True)
-                t.start()
+            t = threading.Thread(
+                target=self._health_poller, args=(port, self.proc, health_path), daemon=True)
+            t.start()
 
     def stop(self):
         with self.lock:
@@ -525,15 +524,18 @@ def make_handler(runner, store):
                 return self._send_json(
                     {"ok": False, "error": f"unknown profile type: {profile_type!r}"}, 400)
             binary = sd_bin(cfg) if profile_type == "sd" else llama_bin(cfg)
+            default_port = SD_DEFAULT_PORT if profile_type == "sd" else LLAMA_DEFAULT_PORT
+            resolved_port = port or default_port
             # Record last_used since the user explicitly chose this profile.
             store.update(lambda s: s.update({"last_used": name}))
             try:
-                runner.start(name, args, port, binary, skip_health=(profile_type == "sd"))
+                health_path = "/sdapi/v1/options" if profile_type == "sd" else "/health"
+                runner.start(name, args, resolved_port, binary, health_path=health_path)
             except FileNotFoundError:
                 msg = f"binary not found: {binary}"
                 runner._emit("system", f"ERROR: {msg}")
                 return self._send_json({"ok": False, "error": msg}, 500)
-            self._send_json({"ok": True, "port": port})
+            self._send_json({"ok": True, "port": resolved_port})
 
         def _post_stop(self):
             runner.stop()
