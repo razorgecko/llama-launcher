@@ -357,11 +357,12 @@ def make_handler(runner, store):
     """Build a request handler class bound to the given runner and store."""
     class Handler(http.server.BaseHTTPRequestHandler):
         _GET_ROUTES = {
-            "/":            "_get_root",
-            "/api/state":   "_get_state",
-            "/api/config":  "_get_config",
-            "/api/logs":    "_get_logs",
-            "/api/profile": "_get_profile",
+            "/":              "_get_root",
+            "/favicon.svg":   "_get_favicon",
+            "/api/state":     "_get_state",
+            "/api/config":    "_get_config",
+            "/api/logs":      "_get_logs",
+            "/api/profile":   "_get_profile",
         }
         _POST_ROUTES = {
             "/api/start":      "_post_start",
@@ -428,6 +429,10 @@ def make_handler(runner, store):
 
         def _get_root(self):
             self._send(200, "text/html; charset=utf-8", INDEX_PATH.read_bytes())
+
+        def _get_favicon(self):
+            p = SCRIPT_DIR / "llama-icon.svg"
+            self._send(200, "image/svg+xml", p.read_bytes())
 
         def _get_state(self):
             cfg = load_config()
