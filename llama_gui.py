@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socketserver
 import subprocess
 import sys
@@ -35,6 +36,23 @@ RESTART_FIELDS = {"port", "host"}
 # llama-server listens on this port when --port is not specified.
 LLAMA_DEFAULT_PORT = 8080
 
+# Hosts considered safe to bind without authentication. Anything else requires
+# the user to set LLAMA_LAUNCHER_ALLOW_REMOTE=1 — see the guard in main() and
+# in _post_config. Every endpoint is unauthenticated, and several can spawn
+# arbitrary processes, so binding to a routable address without that opt-in
+# would be an RCE-by-default footgun.
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+def _is_loopback(host):
+    return host in LOOPBACK_HOSTS
+
+def _validate_llama_bin(value):
+    """True if `value` resolves to an executable file (PATH lookup or path)."""
+    expanded = os.path.expanduser(value)
+    if "/" in expanded:
+        return os.path.isfile(expanded) and os.access(expanded, os.X_OK)
+    return shutil.which(expanded) is not None
+
 # ---- config -----------------------------------------------------------------
 
 _cfg_lock = threading.RLock()
@@ -48,10 +66,10 @@ def load_config():
         try:
             mtime = CONFIG_PATH.stat().st_mtime
         except OSError:
-            mtime = 0.0
+            mtime = None
         if _cfg_cache is not None and mtime == _cfg_mtime:
             return dict(_cfg_cache)
-        if not CONFIG_PATH.exists():
+        if mtime is None:
             save_config(DEFAULT_CONFIG)
             return dict(DEFAULT_CONFIG)
         try:
@@ -62,10 +80,7 @@ def load_config():
         merged = dict(DEFAULT_CONFIG)
         merged.update({k: v for k, v in cfg.items() if k in DEFAULT_CONFIG})
         _cfg_cache = merged
-        try:
-            _cfg_mtime = CONFIG_PATH.stat().st_mtime
-        except OSError:
-            pass
+        _cfg_mtime = mtime
         return dict(merged)
 
 def save_config(cfg):
@@ -389,8 +404,21 @@ def make_handler(runner, store):
             else:
                 self.send_error(404)
 
+        def _check_origin(self):
+            """Block cross-origin POSTs to defend against CSRF from a browser.
+            Browsers always send Origin on POST; same-origin requests have it
+            matching the Host header. Tools without an Origin (curl, scripts)
+            are out of scope for the browser threat model and are allowed."""
+            origin = self.headers.get("Origin")
+            if origin is None:
+                return True
+            return origin == f"http://{self.headers.get('Host', '')}"
+
         def do_GET(self):  self._dispatch(self._GET_ROUTES)
-        def do_POST(self): self._dispatch(self._POST_ROUTES)
+        def do_POST(self):
+            if not self._check_origin():
+                return self.send_error(403, "cross-origin POST blocked")
+            self._dispatch(self._POST_ROUTES)
 
         # -- GET handlers --
 
@@ -498,19 +526,17 @@ def make_handler(runner, store):
             direction = self._qs.get("direction", [""])[0]
             if direction not in ("up", "down"):
                 return self._send_json({"ok": False, "error": "bad direction"}, 400)
+            delta = -1 if direction == "up" else 1
             def move(s):
                 favs = s["favorites"]
-                last = s["last_used"]
                 # Visible order excludes last_used (which lives in its own slot).
-                visible = [f for f in favs if f != last]
+                visible = [f for f in favs if f != s["last_used"]]
                 if name not in visible:
                     return
                 i = visible.index(name)
-                j = i + (-1 if direction == "up" else 1)
-                if j < 0 or j >= len(visible):
+                if not 0 <= i + delta < len(visible):
                     return
-                neighbor = visible[j]
-                a, b = favs.index(name), favs.index(neighbor)
+                a, b = favs.index(name), favs.index(visible[i + delta])
                 favs[a], favs[b] = favs[b], favs[a]
             store.update(move)
             self._send_json({"ok": True})
@@ -532,6 +558,16 @@ def make_handler(runner, store):
                         {"ok": False, "error": f"wrong type for {k}"}, 400)
             if not (1 <= updated["port"] <= 65535):
                 return self._send_json({"ok": False, "error": "port must be 1-65535"}, 400)
+            if (not _is_loopback(updated["host"])
+                    and not os.environ.get("LLAMA_LAUNCHER_ALLOW_REMOTE")):
+                return self._send_json(
+                    {"ok": False, "error":
+                     "non-loopback host requires LLAMA_LAUNCHER_ALLOW_REMOTE=1 "
+                     "(every endpoint is unauthenticated)"}, 400)
+            if not _validate_llama_bin(updated["llama_bin"]):
+                return self._send_json(
+                    {"ok": False, "error":
+                     f"llama_bin {updated['llama_bin']!r} is not an executable"}, 400)
             save_config(updated)
             needs_restart = any(updated[k] != cfg[k] for k in RESTART_FIELDS)
             self._send_json({"ok": True, "needs_restart": needs_restart})
@@ -544,31 +580,37 @@ def make_handler(runner, store):
             if body is None or not isinstance(body.get("content"), str):
                 return self._send_json({"ok": False, "error": "missing content"}, 400)
             new_name = body.get("new_name")
-            if new_name is not None:
-                if not isinstance(new_name, str) or not _valid_profile_id(new_name):
-                    return self._send_json({"ok": False, "error": "invalid new filename"}, 400)
+            if new_name is not None and (not isinstance(new_name, str)
+                                         or not _valid_profile_id(new_name)):
+                return self._send_json({"ok": False, "error": "invalid new filename"}, 400)
+
             cfg = load_config()
             dest_name = new_name if new_name and new_name != name else name
+            old_conf = profiles_path(cfg) / f"{name}.conf"
+            new_conf = profiles_path(cfg) / f"{dest_name}.conf"
+            is_rename = new_conf != old_conf
+
+            if (body.get("is_new") or is_rename) and new_conf.exists():
+                return self._send_json(
+                    {"ok": False, "error": "a profile with that filename already exists"}, 409)
+
+            # Hold runner.lock so the running-profile check and the file write
+            # are atomic with respect to /api/start.
             with runner.lock:
                 if (runner.proc and runner.proc.poll() is None
                         and runner.profile_name in (name, dest_name)):
                     return self._send_json(
                         {"ok": False, "error": "cannot edit a running profile"}, 409)
-            old_conf = profiles_path(cfg) / f"{name}.conf"
-            new_conf = profiles_path(cfg) / f"{dest_name}.conf"
-            if body.get("is_new") and new_conf.exists():
-                return self._send_json({"ok": False, "error": "a profile with that filename already exists"}, 409)
-            if new_conf != old_conf and new_conf.exists():
-                return self._send_json({"ok": False, "error": "a profile with that filename already exists"}, 409)
-            tmp = new_conf.with_suffix(".conf.tmp")
-            try:
-                tmp.write_text(body["content"])
-                os.replace(tmp, new_conf)
-                if new_conf != old_conf:
-                    old_conf.unlink(missing_ok=True)
-            except OSError as e:
-                return self._send_json({"ok": False, "error": str(e)}, 500)
-            if new_conf != old_conf:
+                tmp = new_conf.with_suffix(".conf.tmp")
+                try:
+                    tmp.write_text(body["content"])
+                    os.replace(tmp, new_conf)
+                    if is_rename:
+                        old_conf.unlink(missing_ok=True)
+                except OSError as e:
+                    return self._send_json({"ok": False, "error": str(e)}, 500)
+
+            if is_rename:
                 def rename_refs(s):
                     if s.get("last_used") == name:
                         s["last_used"] = dest_name
@@ -604,18 +646,20 @@ def make_handler(runner, store):
             name = self._qs.get("profile", [""])[0]
             if not _valid_profile_id(name):
                 return self._send_json({"ok": False, "error": "invalid profile id"}, 400)
+            cfg = load_config()
+            conf = profiles_path(cfg) / f"{name}.conf"
+            # Hold runner.lock so the running-profile check and the unlink
+            # are atomic with respect to /api/start.
             with runner.lock:
                 if runner.proc and runner.profile_name == name:
                     return self._send_json(
                         {"ok": False, "error": "cannot delete a running profile"}, 409)
-            cfg = load_config()
-            conf = profiles_path(cfg) / f"{name}.conf"
-            if not conf.exists():
-                return self._send_json({"ok": False, "error": "no such profile"}, 404)
-            try:
-                conf.unlink()
-            except OSError as e:
-                return self._send_json({"ok": False, "error": str(e)}, 500)
+                if not conf.exists():
+                    return self._send_json({"ok": False, "error": "no such profile"}, 404)
+                try:
+                    conf.unlink()
+                except OSError as e:
+                    return self._send_json({"ok": False, "error": str(e)}, 500)
             # Remove from favorites / last_used so stale ids don't linger.
             def cleanup(s):
                 if name in s["favorites"]:
@@ -650,6 +694,14 @@ class ReusableTCPServer(socketserver.ThreadingTCPServer):
 
 def main():
     cfg = load_config()
+    if (not _is_loopback(cfg["host"])
+            and not os.environ.get("LLAMA_LAUNCHER_ALLOW_REMOTE")):
+        sys.exit(
+            f"refusing to bind to non-loopback host {cfg['host']!r}: every "
+            f"endpoint is unauthenticated and would let anyone reachable on "
+            f"the network execute arbitrary commands.\n"
+            f"set LLAMA_LAUNCHER_ALLOW_REMOTE=1 to override."
+        )
     profiles_dir = profiles_path(cfg)
     profiles_dir.mkdir(parents=True, exist_ok=True)
     if not INDEX_PATH.exists():

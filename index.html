@@ -106,8 +106,10 @@
   .row .menu-dropdown button:hover:not(:disabled) { background: #f5f5f5; }
   .row .menu-dropdown button:disabled { color: var(--muted); cursor: default; }
   .row .menu-dropdown button.danger { color: #c62828; }
-  .row .menu-dropdown button.danger:hover { background: #ffebee; }
+  .row .menu-dropdown button.danger:disabled { color: #e57373; }
+  .row .menu-dropdown button.danger:hover:not(:disabled) { background: #ffebee; }
   .row .menu-dropdown hr { margin: .2rem 0; border: none; border-top: 1px solid var(--border); }
+  .stop-hint { font-size: .8em; opacity: .7; }
 
   /* settings */
   .field { margin: .8rem 0; }
@@ -440,7 +442,7 @@ function profileRow(p, s, opts = {}) {
   editItem.textContent = "Edit";
   if (isRunning) {
     editItem.disabled = true;
-    editItem.textContent = "Edit (stop first)";
+    editItem.innerHTML = "Edit<br><span class='stop-hint'>(stop first)</span>";
   } else {
     editItem.onclick = () => { closeDrop(); openEditor(p.id, p.name); };
   }
@@ -449,8 +451,14 @@ function profileRow(p, s, opts = {}) {
   copyItem.onclick = () => { closeDrop(); copyAction(p.id); };
   const hr = document.createElement("hr");
   const deleteItem = document.createElement("button");
-  deleteItem.textContent = "Delete"; deleteItem.className = "danger";
-  deleteItem.onclick = () => { closeDrop(); deleteAction(p.id, p.name); };
+  deleteItem.className = "danger";
+  if (isRunning) {
+    deleteItem.innerHTML = "Delete<br><span class='stop-hint'>(stop first)</span>";
+    deleteItem.disabled = true;
+  } else {
+    deleteItem.textContent = "Delete";
+    deleteItem.onclick = () => { closeDrop(); deleteAction(p.id, p.name); };
+  }
   menuDrop.append(editItem, copyItem, hr, deleteItem);
   menuWrap.append(menuBtn, menuDrop);
   function closeDrop() { menuDrop.classList.remove("open"); }
