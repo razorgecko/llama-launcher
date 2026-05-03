@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socketserver
 import subprocess
 import sys
@@ -18,6 +19,11 @@ import webbrowser
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+
+try:
+    import resource  # POSIX-only; used to cap probe subprocess limits.
+except ImportError:
+    resource = None
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 INDEX_PATH = SCRIPT_DIR / "index.html"
@@ -47,6 +53,26 @@ RESTART_FIELDS = {"port", "host"}
 LLAMA_DEFAULT_PORT = 8080
 SD_DEFAULT_PORT = 1234
 
+# Hard cap on request body size. The largest legitimate body is a profile
+# .conf, which is a handful of CLI args. 1 MiB is generous; anything bigger
+# is either a bug or an attempt to exhaust memory via Content-Length.
+MAX_JSON_BODY = 1 * 1024 * 1024
+
+# Content-Security-Policy for the index page. 'unsafe-inline' is required
+# because the JS and CSS are inlined into index.html (the app is two files
+# by design). Everything else is locked down: no external scripts, styles,
+# or images; no framing; no <base> injection.
+INDEX_CSP = (
+    "default-src 'none'; "
+    "script-src 'unsafe-inline'; "
+    "style-src 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "connect-src 'self'; "
+    "frame-ancestors 'none'; "
+    "base-uri 'none'; "
+    "form-action 'none'"
+)
+
 # Hosts considered safe to bind without authentication. Anything else requires
 # the user to set LLAMA_LAUNCHER_ALLOW_REMOTE=1 — see the guard in main() and
 # in _post_config. Every endpoint is unauthenticated, and several can spawn
@@ -57,12 +83,107 @@ LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 def _is_loopback(host):
     return host in LOOPBACK_HOSTS
 
+def _hostname_from_header(host_header):
+    """Strip the port from a Host header. Handles IPv6 ('[::1]:7777')."""
+    if not host_header:
+        return ""
+    if host_header.startswith("["):
+        end = host_header.find("]")
+        return host_header[1:end] if end != -1 else host_header
+    return host_header.split(":", 1)[0]
+
 def _validate_binary(value):
     """True if `value` resolves to an executable file (PATH lookup or path)."""
     expanded = os.path.expanduser(value)
     if "/" in expanded:
         return os.path.isfile(expanded) and os.access(expanded, os.X_OK)
     return shutil.which(expanded) is not None
+
+# Substrings expected in the combined --version/--help output of each kind
+# of model server. Comparison is case-insensitive. These are deliberately
+# loose (just "llama") so custom builds with extra suffixes still match.
+BIN_SIGNATURES = {
+    "llama": ("llama",),
+    "sd":    ("stable-diffusion", "stable diffusion"),
+}
+
+def _probe_rlimits():
+    """preexec_fn for the binary probe. Caps CPU, memory, file size, and
+    open files in the child. POSIX-only; no-op on platforms without the
+    resource module."""
+    if resource is None:
+        return
+    # 5s CPU (timeout is 3s wall-clock; this also catches busy loops in
+    # children of the probe, which inherit limits across fork).
+    resource.setrlimit(resource.RLIMIT_CPU, (5, 5))
+    # 256 MB address space — enough for any sensible --version path.
+    resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
+    # 1 MB max written file size — blocks dd-style filesystem fill.
+    resource.setrlimit(resource.RLIMIT_FSIZE, (1 * 1024 * 1024, 1 * 1024 * 1024))
+    # 64 file descriptors.
+    resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+
+def _run_probe(args, timeout=3):
+    """Run a probe subprocess with strict resource limits and a hard
+    timeout. start_new_session=True puts the child in its own process
+    group so we can kill the whole tree on timeout (without it, an
+    orphaned grandchild could survive). Returns (stdout, stderr) on
+    success, or (None, None) on launch failure / timeout."""
+    try:
+        p = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            start_new_session=True,
+            preexec_fn=_probe_rlimits,
+        )
+    except OSError:
+        return None, None
+    try:
+        out, err = p.communicate(timeout=timeout)
+        return out, err
+    except subprocess.TimeoutExpired:
+        # Kill the entire process group so daemonised grandchildren die too.
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            p.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        return None, None
+
+def _probe_binary_kind(value, kind):
+    """Run `<binary> --version` (then --help on miss) and check the combined
+    stdout+stderr contains a signature substring for the expected kind.
+    Defends against pointing llama_bin at /bin/bash. Bypassed by setting
+    LLAMA_LAUNCHER_TRUST_BINARIES=1, for users running custom-branded builds.
+
+    The probe still EXECUTES the candidate binary, which is the smallest
+    blast radius we can manage in stdlib Python: stdin=DEVNULL prevents
+    interactive prompts, start_new_session+killpg cleans up runaway children,
+    and rlimits cap CPU / memory / disk damage. It does not protect against
+    a binary that does damage in pre-main / global constructors. The user
+    must avoid pointing the field at untrusted paths in the first place."""
+    if os.environ.get("LLAMA_LAUNCHER_TRUST_BINARIES"):
+        return True
+    expanded = os.path.expanduser(value)
+    resolved = expanded if "/" in expanded else shutil.which(expanded)
+    if not resolved:
+        return False
+    sigs = [s.lower() for s in BIN_SIGNATURES[kind]]
+    for probe in ("--version", "--help"):
+        out, err = _run_probe([resolved, probe])
+        if out is None:
+            continue
+        haystack = (out + err).lower()
+        if any(sig in haystack for sig in sigs):
+            return True
+    return False
 
 # ---- config -----------------------------------------------------------------
 
@@ -182,8 +303,8 @@ def parse_profile(path, meta_only=False, models_dir=""):
     """Return (args, port, meta) from a .conf file.
 
     - Comments starting with # are stripped from arg parsing.
-    - Special comments like '# name: Foo' or '# description: ...' are extracted
-      into the meta dict (keys: name, description). They must appear on their
+    - Special comments like '# name: Foo' or '# type: sd' are extracted
+      into the meta dict (keys: name, description, type). They must appear on their
       own line, anywhere in the file. First occurrence wins.
     - Tokens starting with ~ are expanded to the user's home directory.
     - Tokens starting with ./ are resolved against models_dir (if set).
@@ -236,10 +357,22 @@ def _valid_profile_id(name):
     """True if name is safe to use as a profile filename stem (no path traversal)."""
     return bool(name and _PROFILE_ID_RE.match(name) and ".." not in name)
 
+def _profile_under_dir(conf_path, profiles_dir):
+    """True if conf_path resolves to a real path inside profiles_dir.
+    Defends against a symlinked .conf pointing at files elsewhere on the
+    filesystem; without this, read_text() / Path.open() would happily follow
+    the symlink."""
+    try:
+        resolved = conf_path.resolve()
+        resolved.relative_to(profiles_dir.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
 # ---- process runner ---------------------------------------------------------
 
 class Runner:
-    """Manages the running llama-server subprocess and captures its output.
+    """Manages the running model server subprocess (llama-server or sd-server) and captures its output.
 
     Two locks: `lock` guards the process slot (proc/name/port). `logs_lock`
     guards the log buffer. They are separate to prevent a deadlock where
@@ -396,12 +529,14 @@ def make_handler(runner, store):
 
         def log_message(self, format, *a): pass
 
-        def _send(self, code, ctype, body):
+        def _send(self, code, ctype, body, extra_headers=None):
             if isinstance(body, str):
                 body = body.encode()
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            for k, v in (extra_headers or ()):
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
@@ -409,7 +544,12 @@ def make_handler(runner, store):
             self._send(code, "application/json", json.dumps(payload))
 
         def _read_json(self):
-            length = int(self.headers.get("Content-Length", 0))
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                return None
+            if length < 0 or length > MAX_JSON_BODY:
+                return None
             if not length:
                 return {}
             try:
@@ -426,6 +566,17 @@ def make_handler(runner, store):
             else:
                 self.send_error(404)
 
+        def _check_host(self):
+            """DNS rebinding mitigation. The Host header must name a loopback
+            address; otherwise an attacker page hosted on evil.example:<port>
+            can use DNS rebinding to flip its own name to 127.0.0.1 and bypass
+            the same-origin Origin/Host equality check below. Skipped when
+            bound to a non-loopback address, since LLAMA_LAUNCHER_ALLOW_REMOTE
+            opts into a wider audience."""
+            if os.environ.get("LLAMA_LAUNCHER_ALLOW_REMOTE"):
+                return True
+            return _is_loopback(_hostname_from_header(self.headers.get("Host", "")))
+
         def _check_origin(self):
             """Block cross-origin POSTs to defend against CSRF from a browser.
             Browsers always send Origin on POST; same-origin requests have it
@@ -436,8 +587,13 @@ def make_handler(runner, store):
                 return True
             return origin == f"http://{self.headers.get('Host', '')}"
 
-        def do_GET(self):  self._dispatch(self._GET_ROUTES)
+        def do_GET(self):
+            if not self._check_host():
+                return self.send_error(403, "host not allowed")
+            self._dispatch(self._GET_ROUTES)
         def do_POST(self):
+            if not self._check_host():
+                return self.send_error(403, "host not allowed")
             if not self._check_origin():
                 return self.send_error(403, "cross-origin POST blocked")
             self._dispatch(self._POST_ROUTES)
@@ -445,7 +601,12 @@ def make_handler(runner, store):
         # -- GET handlers --
 
         def _get_root(self):
-            self._send(200, "text/html; charset=utf-8", INDEX_PATH.read_bytes())
+            self._send(200, "text/html; charset=utf-8", INDEX_PATH.read_bytes(),
+                       extra_headers=[
+                           ("Content-Security-Policy", INDEX_CSP),
+                           ("X-Content-Type-Options", "nosniff"),
+                           ("Referrer-Policy", "no-referrer"),
+                       ])
 
         def _get_favicon(self):
             p = SCRIPT_DIR / "llama-icon.svg"
@@ -510,6 +671,8 @@ def make_handler(runner, store):
             conf = profiles_path(cfg) / f"{name}.conf"
             if not conf.is_file():
                 return self._send_json({"ok": False, "error": "no such profile"}, 404)
+            if not _profile_under_dir(conf, profiles_path(cfg)):
+                return self._send_json({"ok": False, "error": "no such profile"}, 404)
             try:
                 content = conf.read_text()
             except OSError as e:
@@ -520,11 +683,18 @@ def make_handler(runner, store):
 
         def _post_start(self):
             name = self._qs.get("profile", [""])[0]
+            if not _valid_profile_id(name):
+                return self._send_json({"ok": False, "error": "invalid profile id"}, 400)
             cfg = load_config()
             conf = profiles_path(cfg) / f"{name}.conf"
             if not conf.is_file():
                 return self._send_json({"ok": False, "error": "no such profile"}, 404)
-            args, port, meta = parse_profile(conf, models_dir=cfg.get("models_dir", ""))
+            if not _profile_under_dir(conf, profiles_path(cfg)):
+                return self._send_json({"ok": False, "error": "no such profile"}, 404)
+            try:
+                args, port, meta = parse_profile(conf, models_dir=cfg.get("models_dir", ""))
+            except ValueError as e:
+                return self._send_json({"ok": False, "error": f"profile parse error: {e}"}, 400)
             profile_type = meta.get("type", "llama")
             if profile_type not in ("llama", "sd"):
                 return self._send_json(
@@ -549,8 +719,8 @@ def make_handler(runner, store):
 
         def _post_favorite(self):
             name = self._qs.get("profile", [""])[0]
-            if not name:
-                return self._send_json({"ok": False, "error": "missing profile"}, 400)
+            if not _valid_profile_id(name):
+                return self._send_json({"ok": False, "error": "invalid profile id"}, 400)
             def toggle(s):
                 if name in s["favorites"]:
                     s["favorites"].remove(name)
@@ -561,6 +731,8 @@ def make_handler(runner, store):
 
         def _post_move(self):
             name = self._qs.get("profile", [""])[0]
+            if not _valid_profile_id(name):
+                return self._send_json({"ok": False, "error": "invalid profile id"}, 400)
             direction = self._qs.get("direction", [""])[0]
             if direction not in ("up", "down"):
                 return self._send_json({"ok": False, "error": "bad direction"}, 400)
@@ -591,7 +763,7 @@ def make_handler(runner, store):
                     updated[k] = v
             # Light type validation against defaults.
             for k, v in updated.items():
-                if not isinstance(v, type(DEFAULT_CONFIG[k])):
+                if type(v) is not type(DEFAULT_CONFIG[k]):
                     return self._send_json(
                         {"ok": False, "error": f"wrong type for {k}"}, 400)
             if not (1 <= updated["port"] <= 65535):
@@ -606,11 +778,24 @@ def make_handler(runner, store):
                 return self._send_json(
                     {"ok": False, "error":
                      f"llama_bin {updated['llama_bin']!r} is not an executable"}, 400)
-            if (updated["sd_bin"] != cfg["sd_bin"]
-                    and not _validate_binary(updated["sd_bin"])):
+            if (updated["llama_bin"] != cfg["llama_bin"]
+                    and not _probe_binary_kind(updated["llama_bin"], "llama")):
                 return self._send_json(
                     {"ok": False, "error":
-                     f"sd_bin {updated['sd_bin']!r} is not an executable"}, 400)
+                     f"{updated['llama_bin']!r} doesn't look like llama-server "
+                     "(no 'llama' in --version or --help output). "
+                     "Set LLAMA_LAUNCHER_TRUST_BINARIES=1 if this is a custom build."}, 400)
+            if updated["sd_bin"] != cfg["sd_bin"]:
+                if not _validate_binary(updated["sd_bin"]):
+                    return self._send_json(
+                        {"ok": False, "error":
+                         f"sd_bin {updated['sd_bin']!r} is not an executable"}, 400)
+                if not _probe_binary_kind(updated["sd_bin"], "sd"):
+                    return self._send_json(
+                        {"ok": False, "error":
+                         f"{updated['sd_bin']!r} doesn't look like sd-server "
+                         "(no 'stable-diffusion' in --version or --help output). "
+                         "Set LLAMA_LAUNCHER_TRUST_BINARIES=1 if this is a custom build."}, 400)
             save_config(updated)
             needs_restart = any(updated[k] != cfg[k] for k in RESTART_FIELDS)
             self._send_json({"ok": True, "needs_restart": needs_restart})
@@ -633,13 +818,15 @@ def make_handler(runner, store):
             new_conf = profiles_path(cfg) / f"{dest_name}.conf"
             is_rename = new_conf != old_conf
 
-            if (body.get("is_new") or is_rename) and new_conf.exists():
-                return self._send_json(
-                    {"ok": False, "error": "a profile with that filename already exists"}, 409)
-
-            # Hold runner.lock so the running-profile check and the file write
-            # are atomic with respect to /api/start.
+            # Hold runner.lock so the existence check, the running-profile
+            # check, and the file write are atomic with respect to each other
+            # and to /api/start. Without it, two concurrent is_new creates
+            # for the same name can both pass the existence check before
+            # either writes.
             with runner.lock:
+                if (body.get("is_new") or is_rename) and new_conf.exists():
+                    return self._send_json(
+                        {"ok": False, "error": "a profile with that filename already exists"}, 409)
                 if (runner.proc and runner.proc.poll() is None
                         and runner.profile_name in (name, dest_name)):
                     return self._send_json(
@@ -671,18 +858,21 @@ def make_handler(runner, store):
             src = profiles_path(cfg) / f"{name}.conf"
             if not src.exists():
                 return self._send_json({"ok": False, "error": "no such profile"}, 404)
+            if not _profile_under_dir(src, profiles_path(cfg)):
+                return self._send_json({"ok": False, "error": "no such profile"}, 404)
             # Find a unique destination name: "name-copy", "name-copy-2", …
             base = f"{name}-copy"
-            new_name = base
-            counter = 2
-            while (profiles_path(cfg) / f"{new_name}.conf").exists():
-                new_name = f"{base}-{counter}"
-                counter += 1
-            dst = profiles_path(cfg) / f"{new_name}.conf"
-            try:
-                dst.write_text(src.read_text())
-            except OSError as e:
-                return self._send_json({"ok": False, "error": str(e)}, 500)
+            with runner.lock:
+                new_name = base
+                counter = 2
+                while (profiles_path(cfg) / f"{new_name}.conf").exists():
+                    new_name = f"{base}-{counter}"
+                    counter += 1
+                dst = profiles_path(cfg) / f"{new_name}.conf"
+                try:
+                    shutil.copyfile(src, dst)
+                except OSError as e:
+                    return self._send_json({"ok": False, "error": str(e)}, 500)
             self._send_json({"ok": True, "new_profile": new_name})
 
         def _post_profile_delete(self):
