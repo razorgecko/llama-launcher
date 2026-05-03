@@ -122,7 +122,7 @@
     background: var(--warn-bg); color: var(--warn); border-radius: 3px;
     margin-left: .5rem; vertical-align: middle;
   }
-  #save-msg { margin-left: 1rem; font-size: .9em; }
+  #save-msg { margin-left: 1rem; font-size: .9em; transition: opacity 0.5s ease; }
   #save-msg.ok { color: var(--accent); }
   #save-msg.warn { color: var(--warn); }
   #save-msg.err { color: #c62828; }
@@ -621,7 +621,7 @@ async function saveSettings(ev) {
     else                             body[key] = el.value;
   }
   const msg = document.getElementById("save-msg");
-  msg.className = ""; msg.textContent = "saving…";
+  msg.className = ""; msg.textContent = "saving…"; msg.style.opacity = "1";
   try {
     const r = await fetch("/api/config", {
       method: "POST",
@@ -633,8 +633,12 @@ async function saveSettings(ev) {
       msg.className = "err"; msg.textContent = "error: " + (j.error || "unknown");
     } else if (j.needs_restart) {
       msg.className = "warn"; msg.textContent = "saved — restart launcher for host/port to take effect";
+      setTimeout(() => { msg.style.opacity = "0"; }, 2500);
+      setTimeout(() => { msg.textContent = ""; msg.className = ""; msg.style.opacity = "1"; }, 3000);
     } else {
       msg.className = "ok"; msg.textContent = "saved";
+      setTimeout(() => { msg.style.opacity = "0"; }, 1000);
+      setTimeout(() => { msg.textContent = ""; msg.className = ""; msg.style.opacity = "1"; }, 1500);
     }
   } catch (e) {
     msg.className = "err"; msg.textContent = "save failed";
